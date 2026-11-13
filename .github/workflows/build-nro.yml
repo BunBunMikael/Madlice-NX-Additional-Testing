@@ -20,7 +20,7 @@ on:
         description: Google Drive file ID of the link-shared Alice.zip (Anyone with the link / Viewer)
         required: true
         type: string
-        default: '1SqOWuGOQri0KyPU0RkHDXIqMZ8zfoGFc'
+        default: '1nb57hGJkF1GGYN3AqxvObRwbmW8BSWSQ'
       build_jobs:
         description: Parallel compile jobs (~10 GB RAM at 4; a swap file is added, 2 is the safe choice)
         required: true
