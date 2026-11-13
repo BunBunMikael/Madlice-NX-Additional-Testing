@@ -1,0 +1,41 @@
+# Game files and everything made from them: never committed.
+/disc/
+/assets/
+/cache/
+/app/generated/
+/out/
+
+# Safety net: game file types anywhere in the tree.
+*.xex
+*.iso
+*.hnk
+*.files
+*.wmv
+*.raw
+*.bin
+*.ppm
+AvatarAssetPack
+nxeart
+
+# Python caches
+__pycache__/
+*.pyc
+
+# The local Claude session prompt (personal paths and habits; never published)
+docs/resume-prompt.md
+
+# Local development tools (the PC game build and runs, analysis of the game's code): not part of the published
+# Switch build. They stay on the developer's disk.
+tools/build_pc.sh
+tools/run.sh
+tools/play.sh
+tools/boot_test.sh
+tools/perf_report.py
+tools/thread_sampler.py
+tools/ppcdis.py
+tools/find_disp.py
+tools/find_calls.py
+tools/pointer_fixpoint.py
+tools/switch_profile_report.py
+tools/d3d/
+trailer/

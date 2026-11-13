@@ -1,0 +1,379 @@
+// ue3_extract_shaders: every Xenos shader container in Alice: Madness Returns' cooked packages, offline.
+//
+// alice-nx (2026-11-02): gears2-nx's shaders/gow2_extract_shaders.cpp (GPL-3.0, github.com/VasilkovND/gears2-nx at
+// 3033a796), adapted for Alice's packages (AliceGame/CookedXenon/*.xxx): UE3 file version 690 instead of Gears' 575.
+// Its summary has four more words between DependsOffset and the GUID (ImportExportGuidsOffset, ImportGuidsCount,
+// ExportGuidsCount, ThumbnailTableOffset), checked on AliceEntryExtra.xxx: with them the first compressed chunk's
+// offset is 749, where its tag is; CompressionFlags 4 (LZX). The rest is the original tool. The notes below are its own.
+//
+// Gears of War 2's description:
+// Unreal Engine 3 keeps compiled shaders in shader caches serialized inside its packages (GearGame/CookedXenon/*.xxx:
+// the global and reference shader caches, and one per map with its materials), as the bytes D3DDevice_Create*Shader
+// receives: 2008-format containers (flags 0x102A1100 PS, 0x102A1101 VS, then virtualSize and physicalSize: the
+// container is their sum). The packages are compressed, so each is expanded first, the way the Xbox 360 build of UE3
+// stores them (big-endian):
+//   - fully compressed (most of the startup packages): tag 0x9E2A83C1, block size, compressed and uncompressed totals,
+//     one (compressed, uncompressed) size pair per block, then the blocks;
+//   - chunk compressed (maps): a plain package summary (tag, version 575 in the low 16 bits, ...) whose
+//     CompressedChunks list (uncompressed offset and size, compressed offset and size) points at streams of the first
+//     kind.
+// Each block is an XMemCompress LZX stream (window 2^17): frames prefixed by FF + u16 uncompressed + u16 compressed
+// size, or a bare u16 compressed size (a 0x8000-byte frame); libmspack's lzxd reads the plain bitstream once those
+// prefixes are stripped. The format notes come from gears-of-war-2-pc-port's tools/ue3 (BSD-3-Clause).
+// Files that are neither are scanned as they are. Each container is written once as {vs,ps}_<xxh3>.bin, the key the
+// shader library uses.
+//
+// Usage: ue3_extract_shaders <out dir> <file or folder> ...        (folders are walked; every file is tried)
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
+extern "C" {
+#include "mspack.h"
+#include "lzx.h"
+}
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace {
+
+constexpr uint32_t kTag = 0x9E2A83C1u;
+// alice-nx: the versions whose summary this parses (the chunk-compressed form); others are taken as fully compressed.
+// Words between DependsOffset and the GUID: 575 (Gears) none, 690 (Alice) four. Only those two are checked.
+int SummaryExtraWords(uint32_t version) { return version == 575 ? 0 : version == 690 ? 4 : -1; }
+
+uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
+
+// --- LZX through libmspack, with in-memory "files" ---------------------------------------------------------------
+struct Source {
+  const uint8_t* buf;
+  size_t size, pos, rest;  // rest: bytes left in the current frame
+};
+struct Sink {
+  uint8_t* buf;
+  size_t size, pos;
+};
+
+int ReadFrames(mspack_file* file, void* buffer, int bytes) {
+  auto* f = reinterpret_cast<Source*>(file);
+  if (f->rest == 0) {
+    if (f->pos >= f->size) return 0;
+    if (f->buf[f->pos] == 0xFF) {
+      if (f->pos + 5 > f->size) return 0;
+      f->rest = size_t(f->buf[f->pos + 3]) << 8 | f->buf[f->pos + 4];
+      f->pos += 5;
+    } else {
+      if (f->pos + 2 > f->size) return 0;
+      f->rest = size_t(f->buf[f->pos]) << 8 | f->buf[f->pos + 1];
+      f->pos += 2;
+    }
+    if (f->rest > f->size - f->pos) f->rest = f->size - f->pos;
+    if (f->rest == 0) return 0;
+  }
+  const size_t n = std::min(size_t(bytes), f->rest);
+  std::memcpy(buffer, f->buf + f->pos, n);
+  f->pos += n;
+  f->rest -= n;
+  return int(n);
+}
+int Write(mspack_file* file, void* buffer, int bytes) {
+  auto* f = reinterpret_cast<Sink*>(file);
+  const size_t n = std::min(size_t(bytes), f->size - f->pos);
+  std::memcpy(f->buf + f->pos, buffer, n);
+  f->pos += n;
+  return int(n);
+}
+void* Alloc(mspack_system*, size_t bytes) { return std::calloc(bytes, 1); }
+void Free(void* p) { std::free(p); }
+void Copy(void* src, void* dst, size_t bytes) { std::memmove(dst, src, bytes); }
+void Message(mspack_file*, const char*, ...) {}
+
+mspack_system System() {
+  mspack_system s{};
+  s.read = ReadFrames;
+  s.write = Write;
+  s.alloc = Alloc;
+  s.free = Free;
+  s.copy = Copy;
+  s.message = Message;
+  return s;
+}
+
+// One fully compressed stream at d[0..n) -> out (appended). False if malformed.
+bool Expand(const uint8_t* d, size_t n, std::vector<uint8_t>& out) {
+  if (n < 16 || be32(d) != kTag) return false;
+  const uint32_t block = be32(d + 4), total_u = be32(d + 12);
+  if (block == 0 || total_u > (1u << 30)) return false;
+  const uint32_t blocks = (total_u + block - 1) / block;
+  size_t table = 16, data = table + size_t(blocks) * 8;
+  if (data > n) return false;
+  const size_t base = out.size();
+  out.resize(base + total_u);
+  size_t at = base;
+  mspack_system sys = System();
+  for (uint32_t b = 0; b < blocks; ++b) {
+    const uint32_t csize = be32(d + table + b * 8), usize = be32(d + table + b * 8 + 4);
+    if (data + csize > n || at + usize > out.size()) return false;
+    // alice-nx: a block stored as it is (compressed size = uncompressed size; 88 of Alice's would not decode as LZX).
+    if (csize == usize) {
+      std::memcpy(out.data() + at, d + data, usize);
+      data += csize;
+      at += usize;
+      continue;
+    }
+    // XMemCompress's window is 128 KB by default (2^17); a few chunks (SP_Hospital_03's chunk 20) were compressed with
+    // a larger one and fail with 2^17 at their first frame: the larger windows are tried in turn.
+    int r = MSPACK_ERR_DECRUNCH;
+    Sink dst{out.data() + at, usize, 0};
+    for (int window = 17; window <= 21 && (r != MSPACK_ERR_OK || dst.pos != usize); ++window) {
+      Source src{d + data, csize, 0, 0};
+      dst = Sink{out.data() + at, usize, 0};
+      lzxd_stream* lzx = lzxd_init(&sys, reinterpret_cast<mspack_file*>(&src), reinterpret_cast<mspack_file*>(&dst),
+                                   window, 0, 0x40000, usize, 0);
+      if (!lzx) return false;
+      r = lzxd_decompress(lzx, usize);
+      lzxd_free(lzx);
+      if (r == MSPACK_ERR_OK && dst.pos == usize && window != 17) {
+        std::fprintf(stderr, "  LZX block %u: window 2^%d\n", b, window);
+      }
+    }
+    if (r != MSPACK_ERR_OK || dst.pos != usize) {
+      std::fprintf(stderr, "  LZX block %u of %u: error %d, %zu of %u bytes (compressed %u)\n", b, blocks, r, dst.pos, usize,
+                   csize);
+      return false;
+    }
+    data += csize;
+    at += usize;
+  }
+  out.resize(at);
+  return true;
+}
+
+// A package summary with CompressedChunks: each chunk expanded at its uncompressed offset. False if not one, or bad.
+bool ExpandChunked(const uint8_t* d, size_t n, std::vector<uint8_t>& out, bool& had_chunks, int extra_words) {
+  had_chunks = false;
+  size_t p = 12;  // tag, version, header size
+  auto u32 = [&](uint32_t& v) {
+    if (p + 4 > n) return false;
+    v = be32(d + p);
+    p += 4;
+    return true;
+  };
+  uint32_t v;
+  if (p + 4 > n) return false;
+  const int32_t len = int32_t(be32(d + p));  // folder name (FString)
+  p += 4;
+  p += len > 0 ? size_t(len) : size_t(-int64_t(len)) * 2;
+  for (int i = 0; i < 8 + extra_words; ++i)
+    if (!u32(v)) return false;
+  p += 16;  // guid
+  uint32_t generations;
+  if (!u32(generations) || generations > 1000) return false;
+  p += size_t(generations) * 12;
+  uint32_t flags, count;
+  if (!u32(v) || !u32(v) || !u32(flags) || !u32(count) || count > 100000 || p + size_t(count) * 16 > n) return false;
+  if (count == 0) return true;
+  had_chunks = true;
+  struct Chunk {
+    uint32_t uo, us, co, cs;
+  };
+  std::vector<Chunk> chunks(count);
+  size_t total = 0;
+  for (auto& c : chunks) {
+    c = {be32(d + p), be32(d + p + 4), be32(d + p + 8), be32(d + p + 12)};
+    p += 16;
+    total = std::max(total, size_t(c.uo) + c.us);
+  }
+  if (total > (1u << 30)) return false;
+  out.assign(total, 0);
+  std::memcpy(out.data(), d, std::min<size_t>(chunks[0].uo, n));
+  // A chunk that does not decode (SP_Hospital_03's chunk 20 on some copies) keeps what decoded before the error and
+  // the rest of the package goes on: the garden's shaders are in its other chunks (the whole file used to be dropped).
+  std::vector<uint8_t> part;
+  size_t good = 0, failed = 0;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    const auto& c = chunks[i];
+    if (size_t(c.co) + c.cs > n) {
+      ++failed;
+      continue;
+    }
+    part.clear();
+    if (Expand(d + c.co, c.cs, part) && part.size() == c.us) {
+      ++good;
+    } else {
+      ++failed;
+      std::fprintf(stderr, "  chunk %zu of %zu does not decode: kept what decoded, the rest goes on\n", i, chunks.size());
+    }
+    std::memcpy(out.data() + c.uo, part.data(), std::min<size_t>(part.size(), c.us));
+  }
+  return good > 0;
+}
+
+struct Stats {
+  size_t files = 0, compressed = 0, chunked = 0, plain = 0, bad = 0, magic = 0, found = 0, written = 0;
+} stats;
+std::unordered_set<uint64_t> seen;
+std::filesystem::path out_dir;
+// alice-nx: UE3_EXPAND_DIR=<folder> writes each expanded package there too (to study the formats).
+const char* expand_dir = std::getenv("UE3_EXPAND_DIR");
+void SaveExpanded(const std::filesystem::path& path, const std::vector<uint8_t>& plain) {
+  if (!expand_dir || plain.empty()) return;
+  if (FILE* f = std::fopen((std::filesystem::path(expand_dir) / path.filename()).string().c_str(), "wb")) {
+    std::fwrite(plain.data(), 1, plain.size(), f);
+    std::fclose(f);
+  }
+}
+
+void ScanContainers(const uint8_t* d, size_t n) {
+  for (size_t i = 0; i + 36 <= n; ++i) {
+    if (d[i] != 0x10 || d[i + 1] != 0x2A || d[i + 2] != 0x11) continue;
+    ++stats.magic;
+    if (d[i + 3] > 1) continue;
+    const uint64_t size = uint64_t(be32(d + i + 4)) + be32(d + i + 8);
+    if (size < 36 || size > (4u << 20) || i + size > n) continue;
+    const uint32_t shader_offset = be32(d + i + 24);
+    if (shader_offset >= size) continue;
+    ++stats.found;
+    const uint64_t h = XXH3_64bits(d + i, size);
+    if (!seen.insert(h).second) continue;
+    char name[64];
+    std::snprintf(name, sizeof(name), "%s_%016llx.bin", d[i + 3] ? "vs" : "ps", (unsigned long long)h);
+    if (FILE* f = std::fopen((out_dir / name).string().c_str(), "wb")) {
+      std::fwrite(d + i, 1, size, f);
+      std::fclose(f);
+      ++stats.written;
+    }
+  }
+}
+
+// alice-nx (2026-11-02): Alice's material shaders are not stored as containers in the packages. The SeekFreeShaderCache
+// export holds the shader code in compressed chunks: u32 uncompressed size, u32 compressed size, then an XMemCompress
+// LZX stream (the same framing as the package blocks), each decoding to 3-23 containers (found on
+// Chapter1_W2_ASSEM_01_S.xxx at 2019623 and after, back to back). Every plausible (size, size, frame prefix) is tried;
+// a chunk counts when it decodes in full and holds containers, and the scan goes on after it.
+bool DecodeChunk(const uint8_t* d, size_t csize, std::vector<uint8_t>& out, size_t usize) {
+  out.assign(usize, 0);
+  mspack_system sys = System();
+  Source src{d, csize, 0, 0};
+  Sink dst{out.data(), usize, 0};
+  lzxd_stream* lzx = lzxd_init(&sys, reinterpret_cast<mspack_file*>(&src), reinterpret_cast<mspack_file*>(&dst), 17,
+                               0, 0x40000, usize, 0);
+  if (!lzx) return false;
+  const int r = lzxd_decompress(lzx, usize);
+  lzxd_free(lzx);
+  return r == MSPACK_ERR_OK && dst.pos == usize;
+}
+
+size_t compressed_chunks = 0;
+
+void ScanCompressedCode(const uint8_t* d, size_t n) {
+  std::vector<uint8_t> out;
+  for (size_t p = 0; p + 16 <= n; ++p) {
+    const uint32_t u = be32(d + p), c = be32(d + p + 4);
+    if (u < 256 || u > (4u << 20) || c < 16 || c > u || p + 8 + c > n) continue;
+    const uint8_t* s = d + p + 8;
+    if (s[0] != 0xFF && (uint32_t(s[0]) << 8 | s[1]) > c) continue;
+    if (!DecodeChunk(s, c, out, u)) continue;
+    bool any = false;
+    for (size_t i = 0; i + 3 <= out.size() && !any; ++i)
+      any = out[i] == 0x10 && out[i + 1] == 0x2A && out[i + 2] == 0x11;
+    if (!any) continue;
+    ++compressed_chunks;
+    ScanContainers(out.data(), out.size());
+    p += 7 + c;
+  }
+}
+
+void ScanFile(const std::filesystem::path& path) {
+  std::vector<uint8_t> raw(std::filesystem::file_size(path));
+  FILE* f = std::fopen(path.string().c_str(), "rb");
+  if (!f) {
+    std::fprintf(stderr, "%s: cannot open\n", path.string().c_str());
+    ++stats.bad;
+    return;
+  }
+  const size_t got = std::fread(raw.data(), 1, raw.size(), f);
+  std::fclose(f);
+  raw.resize(got);
+  ++stats.files;
+  std::vector<uint8_t> plain;
+  const size_t before = stats.found;
+  if (raw.size() >= 16 && be32(raw.data()) == kTag) {
+    if (const int extra = SummaryExtraWords(be32(raw.data() + 4) & 0xFFFF); extra >= 0) {
+      bool had_chunks = false;
+      if (!ExpandChunked(raw.data(), raw.size(), plain, had_chunks, extra)) {
+        std::fprintf(stderr, "%s: bad compressed chunks\n", path.string().c_str());
+        ++stats.bad;
+        ScanContainers(raw.data(), raw.size());
+        ScanCompressedCode(raw.data(), raw.size());
+        return;
+      }
+      if (had_chunks) {
+        ++stats.chunked;
+        SaveExpanded(path, plain);
+        ScanContainers(plain.data(), plain.size());
+        ScanCompressedCode(plain.data(), plain.size());
+      } else {
+        ++stats.plain;
+        ScanContainers(raw.data(), raw.size());
+        ScanCompressedCode(raw.data(), raw.size());
+      }
+    } else if (Expand(raw.data(), raw.size(), plain)) {
+      ++stats.compressed;
+      ScanContainers(plain.data(), plain.size());
+        ScanCompressedCode(plain.data(), plain.size());
+    } else {
+      std::fprintf(stderr, "%s: bad compressed stream\n", path.string().c_str());
+      ++stats.bad;
+      ScanContainers(raw.data(), raw.size());
+        ScanCompressedCode(raw.data(), raw.size());
+    }
+  } else {
+    ++stats.plain;
+    ScanContainers(raw.data(), raw.size());
+        ScanCompressedCode(raw.data(), raw.size());
+  }
+  if (stats.found > before) {
+    std::printf("%s: %zu containers\n", path.filename().string().c_str(), stats.found - before);
+  }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc < 3) {
+    std::fprintf(stderr, "usage: %s <out dir> <AliceGame/CookedXenon or files> ...\n", argv[0]);
+    return 1;
+  }
+  out_dir = argv[1];
+  std::filesystem::create_directories(out_dir);
+  for (const auto& entry : std::filesystem::directory_iterator(out_dir)) {
+    // Already extracted: keep their keys so reruns add only new ones.
+    unsigned long long h;
+    if (std::sscanf(entry.path().filename().string().c_str() + 3, "%16llx", &h) == 1) seen.insert(h);
+  }
+  for (int a = 2; a < argc; ++a) {
+    const std::filesystem::path arg = argv[a];
+    if (std::filesystem::is_directory(arg)) {
+      std::vector<std::filesystem::path> files;
+      for (const auto& e : std::filesystem::recursive_directory_iterator(arg))
+        if (e.is_regular_file()) files.push_back(e.path());
+      std::sort(files.begin(), files.end());
+      for (const auto& p : files) ScanFile(p);
+    } else {
+      ScanFile(arg);
+    }
+  }
+  std::printf("files %zu (compressed %zu, chunked %zu, plain %zu, bad %zu); magic %zu, containers found %zu, new files %zu, "
+              "total unique %zu; compressed code chunks %zu\n",
+              stats.files, stats.compressed, stats.chunked, stats.plain, stats.bad, stats.magic, stats.found, stats.written,
+              seen.size(), compressed_chunks);
+  return stats.bad ? 2 : 0;
+}

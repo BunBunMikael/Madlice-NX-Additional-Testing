@@ -1,0 +1,53 @@
+# alice.toml - put it next to alice.nro on the SD card. Graphics tweaks, moved out of the build.
+# Change a value or delete a line to go back to the game's own setting. Restart the game after editing.
+# Leave the banjo_* keys alone, or the console starts compiling shaders again.
+
+# 3D scene resolution as a percent of 720p. 66.7 = 854x480 scaled up (HUD stays 720p). 100 = full 720p.
+alice_screen_percentage = 66.7
+# How far grass and plants are drawn (1.0 = the game's own).
+alice_foliage_distance = 0.5
+# Decals (the Shrink sense's hidden drawings; one near Alice can show as a square).
+alice_decals = true
+# Blur effects: off.
+alice_motion_blur = false
+alice_radial_blur = false
+alice_depth_of_field = false
+# Folds unshadowed lights into cheaper light environments.
+alice_composite_lights = true
+# The game's dynamic shadows (off by default in this build).
+alice_shadows = false
+# Optional draw-distance scales (1.0 = the game's own; unset = the game's own). Fewer draws in busy rooms.
+# alice_decal_distance = 0.5
+# alice_fracture_distance = 0.5
+# UE3's occlusion queries are skipped by default (this build answers every query "visible" anyway, so they only cost
+# draws). true = issue them again.
+# alice_occlusion_queries = true
+# Experiment, off by default: the render thread runs one frame behind the game thread so the two overlap on different
+# cores (a common CPU-bound win, one frame more input lag). Try 1 and compare the fps windows in the log; 0 = lockstep.
+# alice_one_frame_thread_lag = 1
+# More GPU savers, off by default: the SSAO pass and the character bounce light.
+# alice_ambient_occlusion = false
+# alice_sh_lighting = false
+
+
+# Upscaler: how the finished frame is scaled to the screen. Type one of: FSR, Nearest, Bilinear
+alice_upscaler = "Nearest"
+# FSR only: sharpening after the upscale, 0 (none) to 1 (most).
+# alice_fsr_sharpness = 0.8
+# Note: this scales what Renut presents, so for a lower render size use sa2_render_height_handheld / _docked (e.g. 480)
+# rather than alice_screen_percentage, whose upscale is done inside the game before this step.
+# sa2_render_height_handheld = 480
+# sa2_render_height_docked = 480
+
+# Vsync off (frames are shown at once, so tearing is possible). The 30 fps cap stays: it is the game's own presentation
+# interval, timed by the frame pacing, not by vsync. 60 = one refresh a frame instead (alice_frame_rate).
+renut_vsync = false
+# alice_frame_rate = 30
+
+
+# Texture filtering: how textures are sampled. Type one of: Game, Nearest, Bilinear
+# Game = as the game asks; Nearest = nearest-neighbour (also makes the game's internal scene upscale and blurs blocky).
+renut_texture_filtering = "Nearest"
+# Anisotropic filtering. Type one of: Game, 1x, 2x, 4x, 8x, 16x  (1x = off; 2x and up = at least that, where the game filters
+# linearly and uses mipmaps)
+renut_anisotropic_filtering = "1x"

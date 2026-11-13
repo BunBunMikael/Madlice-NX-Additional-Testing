@@ -1,0 +1,16 @@
+# The codegen flavour (included by alice_manifest.toml; root keys: they must stay outside any table). Build-time.
+# sa2-nx's options that need no per-function audit and only change how the C++ is written, not the guest-visible
+# result: no mfmsr/mtmsrd fences, ctx.msr stores or global lock around the guest's interrupt-off sections (skip_msr;
+# mk9-nx, UE3 as this game: its main thread waited a quarter of its samples on that lock), and cr0-cr7, ctr, xer and
+# the lwarx reservation as C++ locals. Right on the console since run 11 (docs/alice-notes.md, 2026-11-04).
+# Not used (they glitched Alice's textures on the console, 2026-11-03/04): non_volatile_as_local, elide_lr_stores and
+# the post-codegen rewrites (no-volatile pch, loop barriers, direct calls).
+skip_msr = true
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+# From the old stage A file (app/perf_overrides.toml, removed 2026-11-05; docs/alice-notes.md 2026-11-03): listed there
+# but never compiled in. Not yet run on the console: test for the glitched textures of runs 6-7 / stage B.
+fctiwz_inline = true
+fp_moves_modeless = true

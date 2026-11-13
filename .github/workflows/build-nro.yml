@@ -1,0 +1,365 @@
+name: build-nro.yml
+
+# Builds ONLY alice.nro from YOUR OWN copy of the game (Alice.zip on Google Drive). No shader cache (deko3d_shaders.bin) and no
+# SD card folder: keep using the deko3d_shaders.bin you already have next to the NRO (the cache is keyed on the translated
+# shaders, so a code-only change like a CPU / culling tweak does not invalidate it).
+# Everything runs directly on the ubuntu-24.04 runner (no Docker): the SDK needs clang 20 + C++23 and a libstdc++
+# that has std::chrono::clock_time_conversion (GCC 13+). The old devkitpro/devkita64 container has an older
+# libstdc++, which is what caused the "explicit specialization of undeclared template struct
+# 'clock_time_conversion'" errors in rex/chrono/chrono.h.
+#
+# Every `run:` step is bash with -x (command tracing), and the build scripts are traced too (BASH_ENV), so the log
+# shows each command before it runs. When the build fails, the tail of every build log is printed.
+#
+# KEEP THIS REPOSITORY PRIVATE: the NRO and shader cache contain the game's translated code and shaders.
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_drive_file_id:
+        description: Google Drive file ID of the link-shared Alice.zip (Anyone with the link / Viewer)
+        required: true
+        type: string
+        default: '1SqOWuGOQri0KyPU0RkHDXIqMZ8zfoGFc'
+      build_jobs:
+        description: Parallel compile jobs (~10 GB RAM at 4; a swap file is added, 2 is the safe choice)
+        required: true
+        type: choice
+        default: '2'
+        options:
+          - '2'
+          - '3'
+          - '4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alice-nx-nro-build-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+
+env:
+  PS4: '+ ${BASH_SOURCE[0]##*/}:${LINENO}: '
+  LLVM_MAJOR: '20'          # the SDK's docs: "LLVM clang 20"; clang 18 is too old
+  CMAKE_VERSION: '3.31.6'   # SDK needs >= 3.25; pinned below 4.x so vendored third-party CMake files keep configuring
+  DEVKITPRO: /opt/devkitpro
+  WORK: /mnt/work           # /mnt has the big free disk; the root disk is too small for this build
+
+jobs:
+  build-nro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      GAME_DRIVE_FILE_ID: ${{ inputs.game_drive_file_id }}
+      BUILD_JOBS: ${{ inputs.build_jobs }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Prepare work area (disk, swap, retry helper)
+        run: |
+          sudo mkdir -p "$WORK"
+          sudo chown "$(id -un):$(id -gn)" "$WORK"
+          mkdir -p "$WORK/tmp"
+
+          cat <<'EOF' | sudo tee /usr/local/bin/retry >/dev/null
+          #!/usr/bin/env bash
+          # retry <attempts> <first-delay-seconds> <command...>
+          attempts="$1" delay="$2"; shift 2
+          for ((i = 1; i <= attempts; i++)); do
+            "$@" && exit 0
+            rc=$?
+            echo "retry: '$*' failed (exit $rc), attempt $i/$attempts" >&2
+            if ((i < attempts)); then sleep "$delay"; delay=$((delay * 2)); ((delay > 120)) && delay=120; fi
+          done
+          exit "${rc:-1}"
+          EOF
+          sudo chmod +x /usr/local/bin/retry
+
+          echo "== Disk"; df -h / "$WORK"
+          echo "== Memory / CPU"; free -h; nproc
+
+          # The translated game needs ~10 GB of RAM at -j4. If the runner has less than 12 GB (private repos get
+          # 7 GB), add a 12 GB swap file on /mnt.
+          if (( $(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo) < 12 )); then
+            sudo swapoff -a || true
+            sudo fallocate -l 12G "$WORK/swapfile"
+            sudo chmod 600 "$WORK/swapfile"
+            sudo mkswap "$WORK/swapfile"
+            sudo swapon "$WORK/swapfile"
+          fi
+          free -h
+
+          avail_gb=$(df --output=avail -BG "$WORK" | tail -n 1 | tr -dc '0-9')
+          if (( avail_gb < 40 )); then
+            echo "::error::Only ${avail_gb} GB free on $WORK; this build needs about 40 GB (game 4.5 GB x3, SDK, build trees)."
+            exit 1
+          fi
+
+          # Command tracing for every bash the build scripts start (BASH_ENV is read by each non-interactive bash).
+          echo 'set -x' > "$WORK/xtrace.sh"
+
+          # Build in /mnt/work (source only, no .git).
+          mkdir -p "$WORK/alice-nx"
+          rsync -a --exclude '.git' "$GITHUB_WORKSPACE/" "$WORK/alice-nx/"
+          {
+            echo "ALICE=$WORK/alice-nx"
+            echo "SA2_NX=$WORK/sa2-nx"
+            echo "TMPDIR=$WORK/tmp"
+          } >> "$GITHUB_ENV"
+          # Windows line endings / lost exec bits would break the scripts.
+          find "$WORK/alice-nx/tools" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
+          find "$WORK/alice-nx/tools" -type f -name '*.sh' -exec chmod +x {} +
+
+      - name: Install host build dependencies (apt)
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          retry 5 10 sudo apt-get update
+          retry 5 10 sudo apt-get install -y --no-install-recommends \
+            build-essential g++-14 libstdc++-14-dev ninja-build git curl wget unzip zstd rsync pkg-config \
+            python3 python3-pip python3-venv python3-pil \
+            libvulkan-dev mesa-vulkan-drivers \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxrender-dev \
+            libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-xkb-dev libxcb-render0-dev libxcb-shm0-dev libxcb-icccm4-dev \
+            libxcb-image0-dev libxcb-keysyms1-dev libxcb-util-dev libxcb-xinerama0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            lsb-release software-properties-common gnupg ca-certificates
+
+      - name: Install CMake (pinned) and gdown
+        run: |
+          python3 -m venv "$WORK/pytools"
+          retry 5 10 "$WORK/pytools/bin/pip" install --disable-pip-version-check --no-cache-dir \
+            "cmake==${CMAKE_VERSION}" gdown
+          # Make this cmake the one every later step finds (only cmake: the venv's python3 has no PIL).
+          sudo ln -sf "$WORK/pytools/bin/cmake" /usr/local/bin/cmake
+          hash -r
+          cmake --version
+          [[ "$(cmake --version | sed -n '1s/[^0-9]*//p')" == "$CMAKE_VERSION" ]]
+
+      - name: Install Clang ${{ env.LLVM_MAJOR }} (apt.llvm.org)
+        run: |
+          retry 5 10 wget -q -O "$WORK/llvm.sh" https://apt.llvm.org/llvm.sh
+          chmod +x "$WORK/llvm.sh"
+          retry 3 15 sudo env DEBIAN_FRONTEND=noninteractive "$WORK/llvm.sh" "$LLVM_MAJOR"
+          sudo update-alternatives --install /usr/bin/clang   clang   "/usr/bin/clang-$LLVM_MAJOR"   200
+          sudo update-alternatives --install /usr/bin/clang++ clang++ "/usr/bin/clang++-$LLVM_MAJOR" 200
+          clang --version
+          clang++ --version
+          [[ "$(clang --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -n 1)" == "$LLVM_MAJOR" ]]
+
+      - name: Install devkitPro (devkitA64, libnx, deko3d, switch-tools) from the official Docker image
+        run: |
+          # apt.devkitpro.org refuses/fails for hosted runners at times (wget exit 8), so take the toolchain from the
+          # official Docker Hub image instead and use it on the host. Tag pinned: same version every run.
+          img=devkitpro/devkita64:20260219
+          retry 8 10 docker pull "$img"
+          cid="$(docker create "$img")"
+          sudo rm -rf "$DEVKITPRO"
+          # docker cp refuses the image's symlinks that point outside /opt/devkitpro (pacman/share/pacman/keyrings),
+          # so stream the folder through tar instead; dangling symlinks are fine there.
+          docker export "$cid" | sudo tar -x -C / opt/devkitpro
+          docker rm "$cid"
+          test -d "$DEVKITPRO/devkitA64"
+          sudo chmod -R a+rX "$DEVKITPRO"
+
+          # Package manager of the image, run in the container against the copied folder (host needs no pacman).
+          dkp() { docker run --rm -v "$DEVKITPRO:$DEVKITPRO" "$img" dkp-pacman "$@"; }
+          if ! dkp -Q devkitA64 libnx deko3d switch-tools; then
+            retry 3 15 sudo docker run --rm -v "$DEVKITPRO:$DEVKITPRO" "$img" \
+              dkp-pacman -Sy --noconfirm --needed devkitA64 libnx deko3d switch-tools
+          fi
+          test -x "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc"
+          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version
+          dkp -Q devkitA64 libnx deko3d switch-tools
+
+      - name: Preflight - toolchain really supports what the SDK needs
+        run: |
+          # Reproduces the exact construct of rex/chrono/chrono.h. If this fails, the SDK build would fail the same way.
+          cat > "$WORK/tmp/chrono_check.cpp" <<'EOF'
+          #include <chrono>
+          struct A { using rep = long long; using period = std::ratio<1, 10000000>;
+                     using duration = std::chrono::duration<rep, period>;
+                     using time_point = std::chrono::time_point<A>;
+                     static constexpr bool is_steady = false; static time_point now() { return {}; } };
+          struct B : A {};
+          namespace std::chrono {
+          template <> struct clock_time_conversion<A, B> {
+            template <class D> A::time_point operator()(const time_point<B, D>&) const { return {}; } };
+          }
+          int main() {}
+          EOF
+          clang++ -std=c++23 -fsyntax-only "$WORK/tmp/chrono_check.cpp"
+
+          {
+            echo '### Toolchain'
+            echo '```'
+            clang --version | head -n 1
+            cmake --version | head -n 1
+            ninja --version
+            python3 --version
+            echo "libstdc++: $(dpkg -s libstdc++-14-dev | sed -n 's/^Version: //p')"
+            "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version | head -n 1
+            ls "$DEVKITPRO"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # SDK: CMake >= 3.25
+          cmake_ver="$(cmake --version | sed -n '1s/[^0-9]*//p')"
+          [[ "$(printf '%s\n3.25\n' "$cmake_ver" | sort -V | head -n 1)" == "3.25" ]]
+
+      - name: Download Alice.zip from Google Drive
+        run: |
+          if [[ ! "$GAME_DRIVE_FILE_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::Invalid Google Drive file ID."
+            exit 1
+          fi
+          archive="$WORK/Alice.zip"
+          delay=15
+          downloaded=false
+          for attempt in 1 2 3 4 5; do
+            rm -f "$archive"
+            if "$WORK/pytools/bin/gdown" "$GAME_DRIVE_FILE_ID" -O "$archive" && [[ -s "$archive" ]] && unzip -tq "$archive" >/dev/null; then
+              downloaded=true
+              break
+            fi
+            echo "Download attempt $attempt/5 failed. Retrying in ${delay}s..." >&2
+            if (( attempt < 5 )); then sleep "$delay"; delay=$((delay * 2)); fi
+          done
+          if [[ "$downloaded" != true ]]; then
+            echo "::error::Google Drive download failed. Check that Alice.zip is shared as 'Anyone with the link' (Viewer); Drive also limits downloads of popular files for 24h."
+            exit 1
+          fi
+          ls -lh "$archive"
+
+      - name: Extract game files and locate the game folder
+        id: extract-game
+        run: |
+          extract_dir="$WORK/alice-game-extracted"
+          mkdir -p "$extract_dir"
+          unzip -q "$WORK/Alice.zip" -d "$extract_dir"
+          rm -f "$WORK/Alice.zip"   # free 4.5 GB
+
+          xex_path="$(find "$extract_dir" -type f -iname 'default.xex' -print -quit)"
+          if [[ -z "$xex_path" ]]; then
+            echo "::error::Alice.zip does not contain default.xex."
+            find "$extract_dir" -maxdepth 3 | head -n 50
+            exit 1
+          fi
+          game_dir="$(dirname "$xex_path")"
+
+          # The build is case-sensitive on Linux: it wants Default.xex, AliceGame/ and Engine/ exactly like this.
+          link_ci() {  # link_ci <wanted-name>   (adds a symlink when only another casing exists)
+            local want="$1" found
+            [[ -e "$game_dir/$want" ]] && return 0
+            found="$(find "$game_dir" -maxdepth 1 -iname "$want" -print -quit)"
+            if [[ -n "$found" ]]; then
+              ln -s "$(basename "$found")" "$game_dir/$want"
+            else
+              echo "::error::'$want' not found in $game_dir (the zip must hold the extracted disc: Default.xex, AliceGame/, Engine/)."
+              ls -la "$game_dir"
+              exit 1
+            fi
+          }
+          link_ci Default.xex
+          link_ci AliceGame
+          link_ci Engine
+
+          echo "game_dir=$game_dir" >> "$GITHUB_OUTPUT"
+          ls -la "$game_dir"
+          du -sh "$game_dir"
+          df -h "$WORK"
+
+      - name: Fetch sa2-nx at the commit the project pins
+        run: |
+          commit="$(sed -n 's/^sa2_commit="\([0-9a-f]\{40\}\)".*/\1/p' "$ALICE/tools/build_from_disc.sh")"
+          [[ -n "$commit" ]]
+          echo "sa2-nx commit: $commit"
+          mkdir -p "$SA2_NX"
+          cd "$SA2_NX"
+          git init -q
+          git remote add origin https://github.com/ChanseyIsTheBest/sa2-nx.git
+          retry 5 10 git fetch -q --depth 1 origin "$commit"
+          git checkout -q FETCH_HEAD
+          [[ "$(git rev-parse HEAD)" == "$commit" ]]
+          # build_from_disc.sh sees .git + matching HEAD and skips its own clone.
+
+      # tools/build_from_disc.sh --nro-only: game translation, the host/Switch shader packages that get linked into the NRO,
+      # the aarch64 compile and tools/check_switch_build.py. It stops right before the (hours-long) shader cache.
+      - name: Build NRO (code, shaders for the Switch, compile)
+        id: build-nro
+        env:
+          GAME_DIR: ${{ steps.extract-game.outputs.game_dir }}
+          BASH_ENV: /mnt/work/xtrace.sh   # -x in every bash the project's scripts start, with file:line (PS4)
+        run: |
+          export DEVKITPRO
+          cd "$ALICE"
+          bash -x tools/build_from_disc.sh "$GAME_DIR" --jobs "$BUILD_JOBS" --nro-only
+
+      # --nro-only prints check_switch_build.py's verdict but exits 0 (the NRO is built either way); surface it here.
+      - name: Report the NRO and the build check
+        if: ${{ !cancelled() && steps.build-nro.outcome == 'success' }}
+        run: |
+          set +x
+          nro="$ALICE/out/nx/alice.nro"
+          [[ -s "$nro" ]] || { echo "::error::alice.nro missing or empty"; exit 1; }
+          rc="$(cat "$ALICE/out/check_switch_build.rc" 2>/dev/null || echo 0)"
+          {
+            echo '### alice.nro'
+            echo '```'
+            ls -l "$nro"
+            sha256sum "$nro"
+            echo "tools/check_switch_build.py exit code: $rc"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$rc" != "0" ]]; then
+            echo "::warning::tools/check_switch_build.py failed (see the build logs artifact); the NRO was still built"
+          fi
+
+      - name: Upload NRO
+        if: ${{ !cancelled() && steps.build-nro.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: alice-nx-nro
+          path: /mnt/work/alice-nx/out/nx/alice.nro
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Show the logs of the failed step
+        if: failure()
+        run: |
+          set +e +x
+          shopt -s nullglob
+          for f in "$SA2_NX"/out_host_configure.log "$SA2_NX"/out_host_build.log \
+                   "$ALICE"/out/codegen.log "$ALICE"/out/pc_configure.log "$ALICE"/out/host_shaders.log \
+                   "$ALICE"/out/shaders_extracted.log "$ALICE"/out/shaders_extracted.err \
+                   "$ALICE"/out/deko3d_tools/*.log \
+                   "$ALICE"/out/nx_configure.log "$ALICE"/out/nx_build.log; do
+            [[ -s "$f" ]] || continue
+            echo "::group::$(basename "$f") (last 150 lines)"
+            tail -n 150 "$f"
+            echo "::endgroup::"
+            echo "---- errors in $(basename "$f") ----"
+            grep -n -E 'error:|FAILED|undefined reference|fatal' "$f" | head -n 40
+          done
+          df -h / "$WORK"; free -h
+          dmesg 2>/dev/null | grep -i -E 'out of memory|killed process' | tail -n 5
+          exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alice-nx-build-logs
+          path: |
+            /mnt/work/sa2-nx/out_host_*.log
+            /mnt/work/alice-nx/out/*.log
+            /mnt/work/alice-nx/out/deko3d_tools/*.log
+          retention-days: 3
+          if-no-files-found: ignore

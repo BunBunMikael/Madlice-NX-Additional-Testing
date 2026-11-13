@@ -1,0 +1,19 @@
+# ReXGlue recompilation manifest for Alice: Madness Returns (Xbox 360 disc, Default.xex).
+#
+# Run tools/codegen.sh: it calls `rexglue codegen alice_manifest.toml`. The project name sets the prefix of everything
+# generated: generated/default/alice_{init,pch,funcs}.h, alice_recomp.N.cpp.
+#
+# Default.xex facts (title ID, media ID, version, image base, entry point, XDK): see docs/alice-notes.md.
+
+[project]
+name = "alice"
+sdk_version = "0.10.0"
+# Your own game files (assets/game_root -> the disc folder). Nothing from the game is distributed with this project.
+game_root = "../assets/game_root"
+
+[entrypoint]
+file_path = "../assets/game_root/Default.xex"
+out_directory_path = "generated/default"
+
+# overrides.toml: written by hand, code the automatic function discovery misses, each entry with its evidence.
+includes = ["overrides.toml", "codegen_flavor.toml"]
