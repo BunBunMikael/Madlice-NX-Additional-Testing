@@ -95,7 +95,7 @@ elseif(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
 endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "17.0")
         message(FATAL_ERROR "ReXGlue requires Clang 18 or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
     endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
