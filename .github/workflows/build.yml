@@ -1,15 +1,13 @@
 name: build.yml
 
-# Builds alice.nro (uploaded first, as soon as it is built) + deko3d_shaders.bin from YOUR OWN copy of the game (Alice.zip on Google Drive).
-# Everything runs directly on the ubuntu-24.04 runner (no Docker): the in-tree ReXGlue SDK needs clang 20 + C++23 and a libstdc++
-# that has std::chrono::clock_time_conversion (GCC 13+). The old devkitpro/devkita64 container has an older
-# libstdc++, which is what caused the "explicit specialization of undeclared template struct
-# 'clock_time_conversion'" errors in rex/chrono/chrono.h.
+# Builds alice.nro + deko3d_shaders.bin from your own Alice.zip on Google Drive.
+# The in-tree ReXGlue SDK requires clang 20, C++23 and a recent libstdc++.
 #
-# Every `run:` step is bash with -x (command tracing), and the build scripts are traced too (BASH_ENV), so the log
-# shows each command before it runs. When the build fails, the tail of every build log is printed.
+# Every run step uses bash tracing. Build scripts are traced too, so the logs
+# show the commands being executed.
 #
-# KEEP THIS REPOSITORY PRIVATE: the NRO and shader cache contain the game's translated code and shaders.
+# KEEP THIS REPOSITORY PRIVATE: build outputs contain translated game code
+# and shaders.
 
 on:
   workflow_dispatch:
@@ -18,9 +16,10 @@ on:
         description: Google Drive file ID of the link-shared Alice.zip (Anyone with the link / Viewer)
         required: true
         type: string
-        default: '1nb57hGJkF1GGYN3AqxvObRwbmW8BSWSQ'
+        default: '1SqOWuGOQri0KyPU0RkHDXIqMZ8zfoGFc'
+
       build_jobs:
-        description: Parallel compile jobs (~10 GB RAM at 4; a swap file is added, 2 is the safe choice)
+        description: Parallel compile jobs (~10 GB RAM at 4; 2 is the safer choice)
         required: true
         type: choice
         default: '2'
@@ -28,6 +27,7 @@ on:
           - '2'
           - '3'
           - '4'
+
       fpcr_one_mode:
         description: 'Experimental CPU optimisation; leave false until Alice gameplay passes the CG-13 denormal census'
         required: true
@@ -50,15 +50,16 @@ defaults:
 
 env:
   PS4: '+ ${BASH_SOURCE[0]##*/}:${LINENO}: '
-  LLVM_MAJOR: '20'          # the SDK's docs: "LLVM clang 20"; clang 18 is too old
-  CMAKE_VERSION: '3.31.6'   # SDK needs >= 3.25; pinned below 4.x so vendored third-party CMake files keep configuring
+  LLVM_MAJOR: '20'
+  CMAKE_VERSION: '3.31.6'
   DEVKITPRO: /opt/devkitpro
-  WORK: /mnt/work           # /mnt has the big free disk; the root disk is too small for this build
+  WORK: /mnt/work
 
 jobs:
   build-switch:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+
     env:
       GAME_DRIVE_FILE_ID: ${{ inputs.game_drive_file_id }}
       BUILD_JOBS: ${{ inputs.build_jobs }}
@@ -82,17 +83,25 @@ jobs:
             "$@" && exit 0
             rc=$?
             echo "retry: '$*' failed (exit $rc), attempt $i/$attempts" >&2
-            if ((i < attempts)); then sleep "$delay"; delay=$((delay * 2)); ((delay > 120)) && delay=120; fi
+            if ((i < attempts)); then
+              sleep "$delay"
+              delay=$((delay * 2))
+              ((delay > 120)) && delay=120
+            fi
           done
           exit "${rc:-1}"
           EOF
+
           sudo chmod +x /usr/local/bin/retry
 
-          echo "== Disk"; df -h / "$WORK"
-          echo "== Memory / CPU"; free -h; nproc
+          echo "== Disk"
+          df -h / "$WORK"
 
-          # The translated game needs ~10 GB of RAM at -j4. If the runner has less than 12 GB (private repos get
-          # 7 GB), add a 12 GB swap file on /mnt.
+          echo "== Memory / CPU"
+          free -h
+          nproc
+
+          # Add swap on smaller hosted runners.
           if (( $(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo) < 12 )); then
             sudo swapoff -a || true
             sudo fallocate -l 12G "$WORK/swapfile"
@@ -100,32 +109,37 @@ jobs:
             sudo mkswap "$WORK/swapfile"
             sudo swapon "$WORK/swapfile"
           fi
+
           free -h
 
           avail_gb=$(df --output=avail -BG "$WORK" | tail -n 1 | tr -dc '0-9')
           if (( avail_gb < 40 )); then
-            echo "::error::Only ${avail_gb} GB free on $WORK; this build needs about 40 GB (game 4.5 GB x3, SDK, build trees)."
+            echo "::error::Only ${avail_gb} GB free on $WORK; this build needs about 40 GB."
             exit 1
           fi
 
-          # Command tracing for every bash the build scripts start (BASH_ENV is read by each non-interactive bash).
+          # Trace commands in child bash scripts.
           echo 'set -x' > "$WORK/xtrace.sh"
 
-          # Build in /mnt/work (source only, no .git).
+          # Copy source to the larger work disk.
           mkdir -p "$WORK/alice-nx"
           rsync -a --exclude '.git' "$GITHUB_WORKSPACE/" "$WORK/alice-nx/"
+
           {
             echo "ALICE=$WORK/alice-nx"
             echo "TMPDIR=$WORK/tmp"
           } >> "$GITHUB_ENV"
-          # Windows line endings / lost exec bits would break the scripts.
+
+          # Normalize project shell scripts and restore executable bits.
           find "$WORK/alice-nx/tools" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
           find "$WORK/alice-nx/tools" -type f -name '*.sh' -exec chmod +x {} +
 
-      - name: Install host build dependencies (apt)
+      - name: Install host build dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
+
           retry 5 10 sudo apt-get update
+
           retry 5 10 sudo apt-get install -y --no-install-recommends \
             build-essential g++-14 libstdc++-14-dev ninja-build git curl wget unzip zstd rsync pkg-config \
             python3 python3-pip python3-venv python3-pil \
@@ -138,69 +152,158 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             lsb-release software-properties-common gnupg ca-certificates
 
-      - name: Install CMake (pinned) and gdown
+      - name: Install CMake and gdown
         run: |
           python3 -m venv "$WORK/pytools"
-          retry 5 10 "$WORK/pytools/bin/pip" install --disable-pip-version-check --no-cache-dir \
-            "cmake==${CMAKE_VERSION}" gdown
-          # Make this cmake the one every later step finds (only cmake: the venv's python3 has no PIL).
+
+          retry 5 10 "$WORK/pytools/bin/pip" install \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            "cmake==${CMAKE_VERSION}" \
+            gdown
+
           sudo ln -sf "$WORK/pytools/bin/cmake" /usr/local/bin/cmake
           hash -r
+
           cmake --version
           [[ "$(cmake --version | sed -n '1s/[^0-9]*//p')" == "$CMAKE_VERSION" ]]
 
-      - name: Install Clang ${{ env.LLVM_MAJOR }} (apt.llvm.org)
+      - name: Install Clang 20
         run: |
           retry 5 10 wget -q -O "$WORK/llvm.sh" https://apt.llvm.org/llvm.sh
           chmod +x "$WORK/llvm.sh"
+
           retry 3 15 sudo env DEBIAN_FRONTEND=noninteractive "$WORK/llvm.sh" "$LLVM_MAJOR"
-          sudo update-alternatives --install /usr/bin/clang   clang   "/usr/bin/clang-$LLVM_MAJOR"   200
-          sudo update-alternatives --install /usr/bin/clang++ clang++ "/usr/bin/clang++-$LLVM_MAJOR" 200
+
+          sudo update-alternatives --install /usr/bin/clang \
+            clang "/usr/bin/clang-$LLVM_MAJOR" 200
+
+          sudo update-alternatives --install /usr/bin/clang++ \
+            clang++ "/usr/bin/clang++-$LLVM_MAJOR" 200
+
           clang --version
           clang++ --version
+
           [[ "$(clang --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -n 1)" == "$LLVM_MAJOR" ]]
 
-      - name: Install devkitPro (devkitA64, libnx, deko3d, switch-tools) from the official Docker image
+      # FIX FOR THE CURRENT BUILD FAILURE:
+      # FFmpeg's config.h and libavutil/avconfig.h are generated files.
+      # The vendored CMake integration expects them, but does not generate them.
+      - name: Generate FFmpeg configuration headers
         run: |
-          # apt.devkitpro.org refuses/fails for hosted runners at times (wget exit 8), so take the toolchain from the
-          # official Docker Hub image instead and use it on the host. Tag pinned: same version every run.
+          set -euxo pipefail
+
+          FF="$ALICE/sdk/thirdparty/FFmpeg"
+
+          test -f "$FF/configure"
+
+          # The vendored FFmpeg snapshot contains CRLF line endings.
+          # Normalize text files only; skip binary files.
+          python3 - "$FF" <<'PYFF'
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          changed = 0
+
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+
+              try:
+                  data = path.read_bytes()
+              except OSError:
+                  continue
+
+              if b"\0" not in data and b"\r\n" in data:
+                  path.write_bytes(data.replace(b"\r\n", b"\n"))
+                  changed += 1
+
+          print(f"Normalized CRLF in {changed} FFmpeg text files")
+          PYFF
+
+          cd "$FF"
+
+          sh ./configure \
+            --cc=clang \
+            --disable-programs \
+            --disable-doc \
+            --disable-network \
+            --disable-autodetect \
+            --disable-shared \
+            --enable-static \
+            --disable-x86asm
+
+          # Fail here with a clear message if FFmpeg did not generate the headers.
+          test -s "$FF/config.h"
+          test -s "$FF/libavutil/avconfig.h"
+
+          echo "FFmpeg configuration headers generated:"
+          ls -lh "$FF/config.h" "$FF/libavutil/avconfig.h"
+
+      - name: Install devkitPro (devkitA64, libnx, deko3d, switch-tools)
+        run: |
+          # Use the official devkitPro image to obtain the Switch toolchain.
           img=devkitpro/devkita64:20260219
+
           retry 8 10 docker pull "$img"
+
           cid="$(docker create "$img")"
+
           sudo rm -rf "$DEVKITPRO"
-          # docker cp refuses the image's symlinks that point outside /opt/devkitpro (pacman/share/pacman/keyrings),
-          # so stream the folder through tar instead; dangling symlinks are fine there.
+
           docker export "$cid" | sudo tar -x -C / opt/devkitpro
           docker rm "$cid"
+
           test -d "$DEVKITPRO/devkitA64"
           sudo chmod -R a+rX "$DEVKITPRO"
 
-          # Package manager of the image, run in the container against the copied folder (host needs no pacman).
-          dkp() { docker run --rm -v "$DEVKITPRO:$DEVKITPRO" "$img" dkp-pacman "$@"; }
+          dkp() {
+            docker run --rm -v "$DEVKITPRO:$DEVKITPRO" "$img" dkp-pacman "$@"
+          }
+
           if ! dkp -Q devkitA64 libnx deko3d switch-tools; then
-            retry 3 15 sudo docker run --rm -v "$DEVKITPRO:$DEVKITPRO" "$img" \
-              dkp-pacman -Sy --noconfirm --needed devkitA64 libnx deko3d switch-tools
+            retry 3 15 sudo docker run --rm \
+              -v "$DEVKITPRO:$DEVKITPRO" \
+              "$img" \
+              dkp-pacman -Sy --noconfirm --needed \
+                devkitA64 libnx deko3d switch-tools
           fi
+
           test -x "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc"
+
           "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version
           dkp -Q devkitA64 libnx deko3d switch-tools
 
-      - name: Preflight - toolchain really supports what the SDK needs
+      - name: Preflight toolchain checks
         run: |
-          # Reproduces the exact construct of rex/chrono/chrono.h. If this fails, the SDK build would fail the same way.
           cat > "$WORK/tmp/chrono_check.cpp" <<'EOF'
           #include <chrono>
-          struct A { using rep = long long; using period = std::ratio<1, 10000000>;
-                     using duration = std::chrono::duration<rep, period>;
-                     using time_point = std::chrono::time_point<A>;
-                     static constexpr bool is_steady = false; static time_point now() { return {}; } };
+
+          struct A {
+              using rep = long long;
+              using period = std::ratio<1, 10000000>;
+              using duration = std::chrono::duration<rep, period>;
+              using time_point = std::chrono::time_point<A>;
+
+              static constexpr bool is_steady = false;
+              static time_point now() { return {}; }
+          };
+
           struct B : A {};
+
           namespace std::chrono {
           template <> struct clock_time_conversion<A, B> {
-            template <class D> A::time_point operator()(const time_point<B, D>&) const { return {}; } };
+              template <class D>
+              A::time_point operator()(const time_point<B, D>&) const {
+                  return {};
+              }
+          };
           }
+
           int main() {}
           EOF
+
           clang++ -std=c++23 -fsyntax-only "$WORK/tmp/chrono_check.cpp"
 
           {
@@ -215,7 +318,7 @@ jobs:
             ls "$DEVKITPRO"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # SDK: CMake >= 3.25
+
           cmake_ver="$(cmake --version | sed -n '1s/[^0-9]*//p')"
           [[ "$(printf '%s\n3.25\n' "$cmake_ver" | sort -V | head -n 1)" == "3.25" ]]
 
@@ -225,87 +328,123 @@ jobs:
             echo "::error::Invalid Google Drive file ID."
             exit 1
           fi
+
           archive="$WORK/Alice.zip"
           delay=15
           downloaded=false
+
           for attempt in 1 2 3 4 5; do
             rm -f "$archive"
-            if "$WORK/pytools/bin/gdown" "$GAME_DRIVE_FILE_ID" -O "$archive" && [[ -s "$archive" ]] && unzip -tq "$archive" >/dev/null; then
+
+            if "$WORK/pytools/bin/gdown" "$GAME_DRIVE_FILE_ID" \
+              -O "$archive" && [[ -s "$archive" ]] && unzip -tq "$archive" >/dev/null; then
               downloaded=true
               break
             fi
+
             echo "Download attempt $attempt/5 failed. Retrying in ${delay}s..." >&2
-            if (( attempt < 5 )); then sleep "$delay"; delay=$((delay * 2)); fi
+
+            if (( attempt < 5 )); then
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
           done
+
           if [[ "$downloaded" != true ]]; then
-            echo "::error::Google Drive download failed. Check that Alice.zip is shared as 'Anyone with the link' (Viewer); Drive also limits downloads of popular files for 24h."
+            echo "::error::Google Drive download failed. Check that Alice.zip is shared as Anyone with the link (Viewer)."
             exit 1
           fi
+
           ls -lh "$archive"
 
-      - name: Extract game files and locate the game folder
+      - name: Extract game files and locate game folder
         id: extract-game
         run: |
           extract_dir="$WORK/alice-game-extracted"
+
           mkdir -p "$extract_dir"
           unzip -q "$WORK/Alice.zip" -d "$extract_dir"
-          rm -f "$WORK/Alice.zip"   # free 4.5 GB
+
+          rm -f "$WORK/Alice.zip"
 
           xex_path="$(find "$extract_dir" -type f -iname 'default.xex' -print -quit)"
+
           if [[ -z "$xex_path" ]]; then
             echo "::error::Alice.zip does not contain default.xex."
             find "$extract_dir" -maxdepth 3 | head -n 50
             exit 1
           fi
+
           game_dir="$(dirname "$xex_path")"
 
-          # The build is case-sensitive on Linux: it wants Default.xex, AliceGame/ and Engine/ exactly like this.
-          link_ci() {  # link_ci <wanted-name>   (adds a symlink when only another casing exists)
-            local want="$1" found
+          # Linux is case-sensitive. Create the expected names if needed.
+          link_ci() {
+            local want="$1"
+            local found
+
             [[ -e "$game_dir/$want" ]] && return 0
+
             found="$(find "$game_dir" -maxdepth 1 -iname "$want" -print -quit)"
+
             if [[ -n "$found" ]]; then
               ln -s "$(basename "$found")" "$game_dir/$want"
             else
-              echo "::error::'$want' not found in $game_dir (the zip must hold the extracted disc: Default.xex, AliceGame/, Engine/)."
+              echo "::error::'$want' not found in $game_dir."
               ls -la "$game_dir"
               exit 1
             fi
           }
+
           link_ci Default.xex
           link_ci AliceGame
           link_ci Engine
 
           echo "game_dir=$game_dir" >> "$GITHUB_OUTPUT"
+
           ls -la "$game_dir"
           du -sh "$game_dir"
           df -h "$WORK"
 
-      - name: Build Alice for Nintendo Switch (in-tree ReXGlue + Renut Ultimate renderer)
+      - name: Build Alice for Nintendo Switch (Renut Ultimate)
         id: build-switch
         env:
           GAME_DIR: ${{ steps.extract-game.outputs.game_dir }}
           BASH_ENV: /mnt/work/xtrace.sh
         run: |
           export DEVKITPRO
+
           cd "$ALICE"
-          bash -x tools/build_from_disc.sh "$GAME_DIR" --jobs "$BUILD_JOBS"
+
+          bash -x tools/build_from_disc.sh \
+            "$GAME_DIR" \
+            --jobs "$BUILD_JOBS"
 
       - name: Stage build outputs
         if: ${{ !cancelled() && steps.build-switch.outcome == 'success' }}
         run: |
           stage="$WORK/stage"
           mkdir -p "$stage"
-          for f in "$ALICE/out/nx/alice.nro" "$ALICE/out/deko3d_shaders/deko3d_shaders.bin"; do
+
+          for f in \
+            "$ALICE/out/nx/alice.nro" \
+            "$ALICE/out/deko3d_shaders/deko3d_shaders.bin"; do
+
             if [[ ! -s "$f" ]]; then
               echo "::error::Expected output missing or empty: $f"
               exit 1
             fi
+
             cp "$f" "$stage/"
           done
-          printf 'Commit: %s\nBuilt: %s\nReXGlue: in-tree Renut Ultimate SDK\nRenderer: Renut Ultimate deko3d\nBLUR_FPCR_ONE_MODE: %s\nclang: %s\n' \
-            "$GITHUB_SHA" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$ALICE_FPCR_ONE_MODE" \
-            "$(clang --version | head -n 1)" > "$stage/BUILD_INFO.txt"
+
+          printf \
+            'Commit: %s\nBuilt: %s\nReXGlue: in-tree Renut Ultimate SDK\nRenderer: Renut Ultimate deko3d\nBLUR_FPCR_ONE_MODE: %s\nclang: %s\n' \
+            "$GITHUB_SHA" \
+            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            "$ALICE_FPCR_ONE_MODE" \
+            "$(clang --version | head -n 1)" \
+            > "$stage/BUILD_INFO.txt"
+
           ls -la "$stage"
 
       - name: Upload Switch build
@@ -323,17 +462,31 @@ jobs:
         run: |
           set +e +x
           shopt -s nullglob
-          for f in "$ALICE"/out_sdk_configure.log "$ALICE"/out_sdk_build.log \
-                   "$ALICE"/out/codegen.log "$ALICE"/out/pc_configure.log "$ALICE"/out/host_shaders.log \
-                   "$ALICE"/out/shaders_extracted.log "$ALICE"/out/shaders_extracted.err \
-                   "$ALICE"/out/deko3d_tools/*.log \
-                   "$ALICE"/out/nx_configure.log "$ALICE"/out/nx_build.log; do
+
+          for f in \
+            "$ALICE"/out_sdk_configure.log \
+            "$ALICE"/out_sdk_build.log \
+            "$ALICE"/out/codegen.log \
+            "$ALICE"/out/pc_configure.log \
+            "$ALICE"/out/host_shaders.log \
+            "$ALICE"/out/shaders_extracted.log \
+            "$ALICE"/out/shaders_extracted.err \
+            "$ALICE"/out/deko3d_tools/*.log \
+            "$ALICE"/out/nx_configure.log \
+            "$ALICE"/out/nx_build.log; do
+
             [[ -s "$f" ]] || continue
+
             echo "::group::$(basename "$f") (last 150 lines)"
             tail -n 150 "$f"
             echo "::endgroup::"
+
             grep -n -E 'error:|FAILED|undefined reference|fatal' "$f" | head -n 40
           done
-          df -h / "$WORK"; free -h
+
+          df -h / "$WORK"
+          free -h
+
           dmesg 2>/dev/null | grep -i -E 'out of memory|killed process' | tail -n 5
+
           exit 0
