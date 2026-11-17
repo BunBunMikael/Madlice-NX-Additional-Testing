@@ -491,9 +491,24 @@ execute_process(
     ERROR_FILE "${FFMPEG_CONFIG_BUILD_DIR}/configure.err"
 )
 if(NOT FFMPEG_CONFIGURE_RESULT EQUAL 0)
+    # Surface the actual FFmpeg configure diagnostics in the CMake/Actions log.
+    execute_process(
+        COMMAND tail -n 100 "${FFMPEG_CONFIG_BUILD_DIR}/configure.log"
+        RESULT_VARIABLE FFMPEG_LOG_TAIL_RESULT
+        OUTPUT_VARIABLE FFMPEG_LOG_TAIL
+        ERROR_VARIABLE FFMPEG_LOG_TAIL_ERROR
+    )
+    execute_process(
+        COMMAND tail -n 100 "${FFMPEG_CONFIG_BUILD_DIR}/configure.err"
+        RESULT_VARIABLE FFMPEG_ERR_TAIL_RESULT
+        OUTPUT_VARIABLE FFMPEG_ERR_TAIL
+        ERROR_VARIABLE FFMPEG_ERR_TAIL_ERROR
+    )
     message(FATAL_ERROR
-        "FFmpeg configure failed (exit ${FFMPEG_CONFIGURE_RESULT}). "
-        "See ${FFMPEG_CONFIG_BUILD_DIR}/configure.log and configure.err")
+        "FFmpeg configure failed (exit ${FFMPEG_CONFIGURE_RESULT}).\n"
+        "----- configure.log (last 100 lines) -----\n${FFMPEG_LOG_TAIL}\n"
+        "----- configure.err (last 100 lines) -----\n${FFMPEG_ERR_TAIL}\n"
+        "Full logs: ${FFMPEG_CONFIG_BUILD_DIR}/configure.log and configure.err")
 endif()
 
 # The upstream Makefile also generates ffversion.h through version.sh.
