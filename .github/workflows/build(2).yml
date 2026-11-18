@@ -1,4 +1,4 @@
-name: build.yml
+name: Build Alice NX for Switch
 
 # Builds alice.nro (uploaded first, as soon as it is built) + deko3d_shaders.bin from YOUR OWN copy of the game (Alice.zip on Google Drive).
 # Everything runs directly on the ubuntu-24.04 runner (no Docker): the SDK needs clang 20 + C++23 and a libstdc++
@@ -18,7 +18,7 @@ on:
         description: Google Drive file ID of the link-shared Alice.zip (Anyone with the link / Viewer)
         required: true
         type: string
-        default: '1nb57hGJkF1GGYN3AqxvObRwbmW8BSWSQ'
+        default: '1SqOWuGOQri0KyPU0RkHDXIqMZ8zfoGFc'
       build_jobs:
         description: Parallel compile jobs (~10 GB RAM at 4; a swap file is added, 2 is the safe choice)
         required: true
@@ -107,7 +107,6 @@ jobs:
           rsync -a --exclude '.git' "$GITHUB_WORKSPACE/" "$WORK/alice-nx/"
           {
             echo "ALICE=$WORK/alice-nx"
-            echo "SA2_NX=$WORK/sa2-nx"
             echo "TMPDIR=$WORK/tmp"
           } >> "$GITHUB_ENV"
           # Windows line endings / lost exec bits would break the scripts.
@@ -296,97 +295,24 @@ jobs:
           path: /mnt/work/alice-game-extracted
           key: alice-game-v1-${{ inputs.game_drive_file_id }}
 
-      - name: Fetch sa2-nx at the commit the project pins
-        run: |
-          commit="$(sed -n 's/^sa2_commit="\([0-9a-f]\{40\}\)".*/\1/p' "$ALICE/tools/build_from_disc.sh")"
-          [[ -n "$commit" ]]
-          echo "sa2-nx commit: $commit"
-          mkdir -p "$SA2_NX"
-          cd "$SA2_NX"
-          git init -q
-          git remote add origin https://github.com/ChanseyIsTheBest/sa2-nx.git
-          retry 5 10 git fetch -q --depth 1 origin "$commit"
-          git checkout -q FETCH_HEAD
-          [[ "$(git rev-parse HEAD)" == "$commit" ]]
-          # build_from_disc.sh sees .git + matching HEAD and skips its own clone.
-
-      # Step 1 builds only the NRO (code translation, host shaders, Switch compile) and uploads it right away, so it can
-      # be tried on the console while the slow shader-cache step below is still running. The NRO does not need
-      # deko3d_shaders.bin to start: without it the console compiles shader variants while playing.
-      - name: Build NRO (code, shaders for the Switch, compile)
-        id: build-nro
+      # The checked-in build_from_disc.sh is a one-shot pipeline: it builds the NRO, precompiles shader variants,
+      # and assembles the SD-card folder. It has no separate NRO-only or shader-only mode.
+      - name: Build Alice for Switch
+        id: build-switch
         env:
           GAME_DIR: ${{ steps.extract-game.outputs.game_dir }}
-          BASH_ENV: /mnt/work/xtrace.sh   # -x in every bash the project's scripts start, with file:line (PS4)
-        run: |
-          export DEVKITPRO
-          cd "$ALICE"
-          bash -x tools/build_from_disc.sh "$GAME_DIR" --jobs "$BUILD_JOBS" --nro-only
-
-      - name: Upload NRO (early, before the shader cache)
-        if: ${{ !cancelled() && steps.build-nro.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: alice-nx-nro-only
-          path: /mnt/work/alice-nx/out/nx/alice.nro
-          retention-days: 1
-          if-no-files-found: error
-          compression-level: 6
-
-      # The shader cache (deko3d_shaders.bin) depends only on the translated shaders and the shader tools, not on the game's
-      # C++: a CPU/streaming change or a check fix leaves it identical. Key = hash of every shader's GLSL text + the
-      # scripts that compile them + the sa2-nx commit. A hit skips the slow precompile. First run: always a miss.
-      - name: Key for the shader cache
-        id: shader-key
-        if: ${{ !cancelled() && steps.build-nro.outcome == 'success' }}
-        run: |
-          cd "$ALICE"
-          glsl_hash="$(find out/deko3d_shaders/glsl_opt -type f -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256sum | cut -d' ' -f1)"
-          tools_hash="$(cat tools/renut/deko3d_variant_cache.py tools/renut/precompile_all_variants.py \
-                            tools/deko3d_build_tools.sh | sha256sum | cut -d' ' -f1)"
-          sa2="$(git -C "$SA2_NX" rev-parse HEAD)"
-          key="dksh-v1-$(printf '%s\n%s\n%s\n' "$glsl_hash" "$tools_hash" "$sa2" | sha256sum | cut -c1-40)"
-          echo "key=$key" | tee -a "$GITHUB_OUTPUT"
-
-      - name: Restore the shader cache
-        id: shader-cache
-        if: ${{ !cancelled() && steps.shader-key.outcome == 'success' }}
-        uses: actions/cache/restore@v4
-        with:
-          path: /mnt/work/alice-nx/out/deko3d_shaders/deko3d_shaders.bin
-          key: ${{ steps.shader-key.outputs.key }}
-
-      - name: Build shader cache and SD card folder (the slow part)
-        id: build-shaders
-        if: ${{ !cancelled() && steps.build-nro.outcome == 'success' }}
-        env:
           BASH_ENV: /mnt/work/xtrace.sh
-          CACHE_HIT: ${{ steps.shader-cache.outputs.cache-hit }}
         run: |
           export DEVKITPRO
           cd "$ALICE"
-          # A restored file is older than the freshly generated glsl_opt, which would make the script remake it: its
-          # content is right (same key), so mark it as newer.
-          if [[ "$CACHE_HIT" == "true" ]]; then
-            echo "shader cache hit: skipping the precompile"
-            touch "$ALICE/out/deko3d_shaders/deko3d_shaders.bin"
-          fi
-          bash -x tools/build_from_disc.sh --shaders-only --jobs "$BUILD_JOBS"
-
-      - name: Save the shader cache
-        if: ${{ !cancelled() && steps.shader-cache.outputs.cache-hit != 'true' && steps.build-shaders.outcome != 'skipped' }}
-        uses: actions/cache/save@v4
-        with:
-          path: /mnt/work/alice-nx/out/deko3d_shaders/deko3d_shaders.bin
-          key: ${{ steps.shader-key.outputs.key }}
+          bash -x tools/build_from_disc.sh "$GAME_DIR" --jobs "$BUILD_JOBS"
 
       - name: Show the logs of the failed step
         if: failure()
         run: |
           set +e +x
           shopt -s nullglob
-          for f in "$SA2_NX"/out_host_configure.log "$SA2_NX"/out_host_build.log \
-                   "$ALICE"/out_sdk_configure.log "$ALICE"/out_sdk_build.log \
+          for f in "$ALICE"/out_sdk_configure.log "$ALICE"/out_sdk_build.log \
                    "$ALICE"/sdk/out/host/thirdparty/ffmpeg-config/configure.log \
                    "$ALICE"/sdk/out/host/thirdparty/ffmpeg-config/configure.err \
                    "$ALICE"/out/codegen.log "$ALICE"/out/pc_configure.log "$ALICE"/out/host_shaders.log \
@@ -405,7 +331,7 @@ jobs:
           exit 0
 
       - name: Stage distributable build outputs
-        if: ${{ !cancelled() && steps.build-shaders.outcome != 'skipped' }}   # also when only check_switch_build.py failed
+        if: ${{ !cancelled() && steps.build-switch.outcome == 'success' }}   # also when only check_switch_build.py failed
         run: |
           df -h "$WORK"
           find "$ALICE/out/nx" -maxdepth 1 -type f -name '*.nro' -printf '%p (%s bytes)\n'
@@ -418,13 +344,13 @@ jobs:
             fi
             cp "$f" "$stage/"
           done
-          printf 'Commit: %s\nBuilt: %s\nsa2-nx: %s\nclang: %s\n' \
-            "$GITHUB_SHA" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$(git -C "$SA2_NX" rev-parse HEAD)" \
+          printf 'Commit: %s\nBuilt: %s\nclang: %s\n' \
+            "$GITHUB_SHA" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             "$(clang --version | head -n 1)" > "$stage/BUILD_INFO.txt"
           ls -la "$stage"
 
       - name: Upload build (private repos only; short retention)
-        if: ${{ !cancelled() && steps.build-shaders.outcome != 'skipped' }}
+        if: ${{ !cancelled() && steps.build-switch.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: alice-nx-switch
@@ -439,7 +365,6 @@ jobs:
         with:
           name: alice-nx-build-logs
           path: |
-            /mnt/work/sa2-nx/out_host_*.log
             /mnt/work/alice-nx/out/*.log
             /mnt/work/alice-nx/out_sdk_*.log
             /mnt/work/alice-nx/sdk/out/host/thirdparty/ffmpeg-config/configure.log
