@@ -432,113 +432,6 @@ endif()
 
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
 
-# FFmpeg's configure script normally generates these headers as part of its
-# Makefile build. This project compiles a curated list of FFmpeg .c files
-# directly with CMake, so the Makefile generation rules are never executed.
-# Generate the same headers in the CMake binary tree before defining the
-# libavutil/libavcodec targets.
-set(FFMPEG_CONFIG_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-config")
-file(MAKE_DIRECTORY "${FFMPEG_CONFIG_BUILD_DIR}/libavutil")
-
-# The vendored FFmpeg snapshot contains CRLF endings in many text files,
-# including configure's helper scripts and generated fragments. Normalize
-# text files (never binary files) before running the upstream configure script.
-# Python is already part of the repository's build/tooling requirements.
-find_program(Python3_EXECUTABLE NAMES python3 python REQUIRED)
-set(FFMPEG_NORMALIZE_TEXT_SCRIPT [=[
-from pathlib import Path
-import sys
-root = Path(sys.argv[1])
-changed = 0
-for path in root.rglob("*"):
-    if not path.is_file():
-        continue
-    try:
-        data = path.read_bytes()
-    except OSError:
-        continue
-    if b"\0" not in data and b"\r\n" in data:
-        path.write_bytes(data.replace(b"\r\n", b"\n"))
-        changed += 1
-print(f"Normalized CRLF in {changed} FFmpeg text files")
-]=])
-execute_process(
-    COMMAND "${Python3_EXECUTABLE}" -c "${FFMPEG_NORMALIZE_TEXT_SCRIPT}" "${FFMPEG_DIR}"
-    RESULT_VARIABLE FFMPEG_NORMALIZE_RESULT
-)
-if(NOT FFMPEG_NORMALIZE_RESULT EQUAL 0)
-    message(FATAL_ERROR
-        "Failed to normalize FFmpeg text files (exit ${FFMPEG_NORMALIZE_RESULT})")
-endif()
-
-find_program(FFMPEG_SH_EXECUTABLE NAMES sh REQUIRED)
-execute_process(
-    COMMAND "${CMAKE_COMMAND}" -E env
-        "CC=${CMAKE_C_COMPILER}"
-        "CXX=${CMAKE_CXX_COMPILER}"
-        "${FFMPEG_SH_EXECUTABLE}" "${FFMPEG_DIR}/configure"
-        "--cc=${CMAKE_C_COMPILER}"
-        --disable-programs
-        --disable-doc
-        --disable-network
-        --disable-autodetect
-        --disable-shared
-        --enable-static
-        --disable-x86asm
-    WORKING_DIRECTORY "${FFMPEG_CONFIG_BUILD_DIR}"
-    RESULT_VARIABLE FFMPEG_CONFIGURE_RESULT
-    OUTPUT_FILE "${FFMPEG_CONFIG_BUILD_DIR}/configure.log"
-    ERROR_FILE "${FFMPEG_CONFIG_BUILD_DIR}/configure.err"
-)
-if(NOT FFMPEG_CONFIGURE_RESULT EQUAL 0)
-    # Surface the actual FFmpeg configure diagnostics in the CMake/Actions log.
-    execute_process(
-        COMMAND tail -n 100 "${FFMPEG_CONFIG_BUILD_DIR}/configure.log"
-        RESULT_VARIABLE FFMPEG_LOG_TAIL_RESULT
-        OUTPUT_VARIABLE FFMPEG_LOG_TAIL
-        ERROR_VARIABLE FFMPEG_LOG_TAIL_ERROR
-    )
-    execute_process(
-        COMMAND tail -n 100 "${FFMPEG_CONFIG_BUILD_DIR}/configure.err"
-        RESULT_VARIABLE FFMPEG_ERR_TAIL_RESULT
-        OUTPUT_VARIABLE FFMPEG_ERR_TAIL
-        ERROR_VARIABLE FFMPEG_ERR_TAIL_ERROR
-    )
-    message(FATAL_ERROR
-        "FFmpeg configure failed (exit ${FFMPEG_CONFIGURE_RESULT}).\n"
-        "----- configure.log (last 100 lines) -----\n${FFMPEG_LOG_TAIL}\n"
-        "----- configure.err (last 100 lines) -----\n${FFMPEG_ERR_TAIL}\n"
-        "Full logs: ${FFMPEG_CONFIG_BUILD_DIR}/configure.log and configure.err")
-endif()
-
-# The upstream Makefile also generates ffversion.h through version.sh.
-# Since CMake compiles FFmpeg sources directly, invoke that generator here too.
-execute_process(
-    COMMAND "${FFMPEG_SH_EXECUTABLE}"
-        "${FFMPEG_DIR}/ffbuild/version.sh"
-        "${FFMPEG_DIR}"
-        "${FFMPEG_CONFIG_BUILD_DIR}/libavutil/ffversion.h"
-        ""
-    WORKING_DIRECTORY "${FFMPEG_CONFIG_BUILD_DIR}"
-    RESULT_VARIABLE FFMPEG_VERSION_RESULT
-    OUTPUT_VARIABLE FFMPEG_VERSION_OUTPUT
-    ERROR_VARIABLE FFMPEG_VERSION_ERROR
-)
-if(NOT FFMPEG_VERSION_RESULT EQUAL 0)
-    message(FATAL_ERROR
-        "FFmpeg version header generation failed (exit ${FFMPEG_VERSION_RESULT}): "
-        "${FFMPEG_VERSION_OUTPUT}${FFMPEG_VERSION_ERROR}")
-endif()
-
-foreach(required_header
-        "${FFMPEG_CONFIG_BUILD_DIR}/config.h"
-        "${FFMPEG_CONFIG_BUILD_DIR}/libavutil/avconfig.h"
-        "${FFMPEG_CONFIG_BUILD_DIR}/libavutil/ffversion.h")
-    if(NOT EXISTS "${required_header}")
-        message(FATAL_ERROR "FFmpeg did not generate required header: ${required_header}")
-    endif()
-endforeach()
-
 # Overlay generated FFmpeg list files
 set(FFMPEG_OVERLAY_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-overlay")
 set(FFMPEG_OVERLAY_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-overlay")
@@ -682,9 +575,6 @@ if(IS_ARM64)
     )
 endif()
 
-target_include_directories(libavutil BEFORE PRIVATE
-    "${FFMPEG_CONFIG_BUILD_DIR}"
-)
 target_include_directories(libavutil
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
@@ -882,9 +772,6 @@ endif()
 
 target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
 
-target_include_directories(libavcodec BEFORE PRIVATE
-    "${FFMPEG_CONFIG_BUILD_DIR}"
-)
 target_include_directories(libavcodec
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
