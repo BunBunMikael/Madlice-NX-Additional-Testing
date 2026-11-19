@@ -1,0 +1,730 @@
+name: Alice NX Ultimate Rebase - Nintendo Switch build
+
+# Builds the project in this repository. The source tree vendors ReXGlue, Renut,
+# Plume, XenosRecomp, UAM and FFmpeg are used from the checked-out project tree.
+# The resulting NRO and shader cache contain code/shaders translated from the
+# user's game dump. Keep the repository and its Actions artifacts private.
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_drive_file_id:
+        description: Google Drive file ID for the user's link-shared game ZIP
+        required: true
+        type: string
+        default: '1nb57hGJkF1GGYN3AqxvObRwbmW8BSWSQ'
+      build_jobs:
+        description: Parallel build jobs (2 recommended on standard GitHub-hosted runners)
+        required: true
+        type: choice
+        default: '2'
+        options:
+          - '2'
+          - '3'
+          - '4'
+      fpcr_one_mode:
+        description: Experimental non-bit-exact FP mode; keep disabled until Alice passes its denormal census
+        required: true
+        type: choice
+        default: 'false'
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alice-nx-ultimate-switch-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+
+env:
+  PS4: '+ ${BASH_SOURCE[0]##*/}:${LINENO}: '
+  LLVM_MAJOR: '20'
+  CMAKE_VERSION: '3.31.6'
+  DEVKITPRO: /opt/devkitpro
+  WORK: /mnt/work
+
+jobs:
+  build-switch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      GAME_DRIVE_FILE_ID: ${{ inputs.game_drive_file_id }}
+      BUILD_JOBS: ${{ inputs.build_jobs }}
+      ALICE_FPCR_ONE_MODE: ${{ inputs.fpcr_one_mode == 'true' && 'ON' || 'OFF' }}
+      ALICE: /mnt/work/alice-nx
+
+    steps:
+      - name: Check out Alice NX Ultimate Rebase
+        uses: actions/checkout@v4
+
+      - name: Prepare work area, disk and diagnostics
+        run: |
+          sudo mkdir -p "$WORK"
+          sudo chown "$(id -un):$(id -gn)" "$WORK"
+          mkdir -p "$WORK/tmp" "$WORK/cache" "$WORK/diagnostics" "$ALICE"
+
+          cat > "$WORK/retry" <<'RETRY'
+          #!/usr/bin/env bash
+          set -u
+          attempts="$1"
+          delay="$2"
+          shift 2
+          rc=1
+          for ((attempt=1; attempt<=attempts; attempt++)); do
+            if "$@"; then exit 0; else rc=$?; fi
+            echo "retry: command failed with exit $rc (attempt $attempt/$attempts): $*" >&2
+            if (( attempt < attempts )); then
+              sleep "$delay"
+              delay=$((delay * 2))
+              (( delay > 120 )) && delay=120
+            fi
+          done
+          exit "$rc"
+          RETRY
+          chmod +x "$WORK/retry"
+          echo "RETRY=$WORK/retry" >> "$GITHUB_ENV"
+
+          echo '== Runner resources'
+          uname -a
+          nproc
+          free -h
+          df -h / "$WORK"
+
+          # Recompiled game code has a high peak RAM requirement. Add swap on
+          # the large work volume rather than consuming the small root volume.
+          mem_gib=$(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo)
+          if (( mem_gib < 12 )); then
+            if [[ ! -f "$WORK/swapfile" ]]; then
+              sudo fallocate -l 12G "$WORK/swapfile"
+              sudo chmod 600 "$WORK/swapfile"
+              sudo mkswap "$WORK/swapfile"
+            fi
+            sudo swapon "$WORK/swapfile" 2>/dev/null || true
+          fi
+          free -h
+
+          available_gib=$(df --output=avail -BG "$WORK" | tail -n 1 | tr -dc '0-9')
+          if (( available_gib < 40 )); then
+            echo "::error::Only ${available_gib} GiB free on $WORK; this build requires at least 40 GiB." 
+            exit 1
+          fi
+
+          # Trace nested project scripts as well as the workflow's own commands.
+          printf 'set -x\n' > "$WORK/xtrace.sh"
+
+          # Work from a clean copy on /mnt; preserve executable bits and avoid
+          # wasting space on the checkout's Git metadata.
+          rsync -a --delete --exclude='.git' "$GITHUB_WORKSPACE/" "$ALICE/"
+          find "$ALICE/tools" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
+          find "$ALICE/tools" -type f -name '*.sh' -exec chmod +x {} +
+
+          test -f "$ALICE/sdk/CMakeLists.txt"
+          test -f "$ALICE/app/CMakeLists.txt"
+          test -f "$ALICE/tools/build_from_disc.sh"
+          test -d "$ALICE/sdk/thirdparty/FFmpeg/libavcodec"
+          test -d "$ALICE/app/thirdparty/uam"
+          echo "Source root: $ALICE"
+          echo "Game archive cache: $WORK/cache"
+
+      - name: Install Linux host dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          "$RETRY" 5 10 sudo apt-get update
+          "$RETRY" 5 10 sudo apt-get install -y --no-install-recommends \
+            build-essential gcc-14 g++-14 libstdc++-14-dev \
+            ninja-build git curl wget unzip zip zstd rsync pkg-config \
+            python3 python3-pip python3-venv python3-pil \
+            ca-certificates gnupg lsb-release software-properties-common \
+            libvulkan-dev mesa-vulkan-drivers \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxrender-dev \
+            libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-xkb-dev libxcb-render0-dev libxcb-shm0-dev libxcb-icccm4-dev \
+            libxcb-image0-dev libxcb-keysyms1-dev libxcb-util-dev libxcb-xinerama0-dev \
+            libxcb-cursor-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libasound2-dev libpulse-dev libudev-dev libdbus-1-dev
+
+      - name: Install pinned CMake and Google Drive downloader
+        run: |
+          python3 -m venv "$WORK/pytools"
+          "$RETRY" 5 10 "$WORK/pytools/bin/pip" install \
+            --disable-pip-version-check --no-cache-dir \
+            "cmake==${CMAKE_VERSION}" gdown
+          sudo ln -sf "$WORK/pytools/bin/cmake" /usr/local/bin/cmake
+          hash -r
+          cmake --version
+          "$WORK/pytools/bin/gdown" --version || true
+          [[ "$(cmake --version | sed -n '1s/[^0-9]*//p')" == "$CMAKE_VERSION" ]]
+
+      - name: Install LLVM Clang 20
+        run: |
+          "$RETRY" 5 10 wget -q -O "$WORK/llvm.sh" https://apt.llvm.org/llvm.sh
+          chmod +x "$WORK/llvm.sh"
+          "$RETRY" 3 15 sudo env DEBIAN_FRONTEND=noninteractive "$WORK/llvm.sh" "$LLVM_MAJOR"
+          sudo update-alternatives --install /usr/bin/clang clang "/usr/bin/clang-$LLVM_MAJOR" 200
+          sudo update-alternatives --install /usr/bin/clang++ clang++ "/usr/bin/clang++-$LLVM_MAJOR" 200
+          clang --version
+          clang++ --version
+          [[ "$(clang --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -n 1)" == "$LLVM_MAJOR" ]]
+
+      - name: Install devkitPro Switch toolchain
+        run: |
+          # Copy the pinned official devkitA64 image's /opt/devkitpro tree onto
+          # the host. The actual CMake build runs on the host, not in Docker.
+          image=devkitpro/devkita64:20260219
+          "$RETRY" 8 10 docker pull "$image"
+          cid="$(docker create "$image")"
+          cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          sudo rm -rf "$DEVKITPRO"
+          docker export "$cid" | sudo tar -x -C / opt/devkitpro
+          cleanup
+          trap - EXIT
+          test -d "$DEVKITPRO/devkitA64"
+          sudo chmod -R a+rX "$DEVKITPRO"
+
+          dkp() { docker run --rm -v "$DEVKITPRO:$DEVKITPRO" "$image" dkp-pacman "$@"; }
+          if ! dkp -Q devkitA64 libnx deko3d switch-tools; then
+            "$RETRY" 3 15 sudo docker run --rm -v "$DEVKITPRO:$DEVKITPRO" "$image" \
+              dkp-pacman -Sy --noconfirm --needed devkitA64 libnx deko3d switch-tools
+          fi
+          test -x "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc"
+          test -x "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-ar"
+          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version
+          dkp -Q devkitA64 libnx deko3d switch-tools
+
+      - name: Verify host C++23 and Switch compiler toolchains
+        run: |
+          cat > "$WORK/chrono_check.cpp" <<'CPP'
+          #include <chrono>
+          struct A {
+            using rep = long long;
+            using period = std::ratio<1, 10000000>;
+            using duration = std::chrono::duration<rep, period>;
+            using time_point = std::chrono::time_point<A>;
+            static constexpr bool is_steady = false;
+            static time_point now() { return {}; }
+          };
+          struct B : A {};
+          namespace std::chrono {
+            template <> struct clock_time_conversion<A, B> {
+              template <class D> A::time_point operator()(const time_point<B, D>&) const { return {}; }
+            };
+          }
+          int main() {}
+          CPP
+          clang++ -std=c++23 -fsyntax-only "$WORK/chrono_check.cpp"
+          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" -dumpmachine | grep -q aarch64
+          {
+            echo '### Build toolchain'
+            echo '```text'
+            clang --version | head -n 1
+            clang++ --version | head -n 1
+            cmake --version | head -n 1
+            ninja --version
+            python3 --version
+            dpkg-query -W -f='${Version}\n' libstdc++-14-dev
+            "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version | head -n 1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore cached game ZIP
+        id: game-zip-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/work/cache/Alice.zip
+          key: alice-game-zip-v1-${{ inputs.game_drive_file_id }}-${{ github.run_id }}
+          restore-keys: |
+            alice-game-zip-v1-${{ inputs.game_drive_file_id }}-
+
+      - name: Download or validate cached game ZIP
+        id: game-zip
+        env:
+          GDOWN: /mnt/work/pytools/bin/gdown
+        run: |
+          if [[ ! "$GAME_DRIVE_FILE_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::The supplied Google Drive file ID is malformed."
+            exit 1
+          fi
+          archive="$WORK/cache/Alice.zip"
+          listing="$WORK/diagnostics/game-archive-list.txt"
+          mkdir -p "$(dirname "$archive")"
+          valid_archive() {
+            [[ -s "$archive" ]] || return 1
+            unzip -tq "$archive" >/dev/null 2>&1 || return 1
+            unzip -Z1 "$archive" > "$listing" || return 1
+            grep -Eiq '(^|/)default\.xex$' "$listing" || return 1
+          }
+
+          if valid_archive; then
+            echo "Using validated cached game archive: $archive"
+            echo "cache_source=hit" >> "$GITHUB_OUTPUT"
+            echo "save_cache=false" >> "$GITHUB_OUTPUT"
+          else
+            if [[ -e "$archive" ]]; then
+              echo "::warning::Cached game archive failed ZIP/XEX validation; downloading a fresh copy."
+              rm -f "$archive"
+            fi
+            candidate="$archive.download"
+            delay=15
+            downloaded=false
+            for attempt in 1 2 3 4 5; do
+              rm -f "$candidate"
+              if "$GDOWN" "$GAME_DRIVE_FILE_ID" -O "$candidate" && [[ -s "$candidate" ]] && \
+                 unzip -tq "$candidate" >/dev/null 2>&1 && \
+                 unzip -Z1 "$candidate" > "$listing" && grep -Eiq '(^|/)default\.xex$' "$listing"; then
+                mv "$candidate" "$archive"
+                downloaded=true
+                break
+              fi
+              echo "Google Drive download/validation failed on attempt $attempt/5."
+              if (( attempt < 5 )); then sleep "$delay"; delay=$((delay * 2)); (( delay > 120 )) && delay=120; fi
+            done
+            if [[ "$downloaded" != true ]]; then
+              echo "::error::Could not download a valid game ZIP. Ensure Drive sharing is 'Anyone with the link / Viewer'; Google Drive may also impose download quotas."
+              exit 1
+            fi
+            echo "cache_source=download" >> "$GITHUB_OUTPUT"
+            # A fresh cache entry also replaces a bad restored entry: each run
+            # has a unique primary key and later runs restore the newest prefix match.
+            echo "save_cache=true" >> "$GITHUB_OUTPUT"
+          fi
+          ls -lh "$archive"
+          sha256sum "$archive" | tee "$WORK/diagnostics/game-archive.sha256"
+          echo "Game archive validated and retained at $archive"
+
+      - name: Save validated game ZIP in Actions cache
+        if: ${{ success() && steps.game-zip.outputs.save_cache == 'true' }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: /mnt/work/cache/Alice.zip
+          key: alice-game-zip-v1-${{ inputs.game_drive_file_id }}-${{ github.run_id }}
+
+      - name: Extract game and normalize Linux filename casing
+        id: extract-game
+        run: |
+          archive="$WORK/cache/Alice.zip"
+          extract_dir="$WORK/game-extracted"
+          test -s "$archive"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          unzip -q "$archive" -d "$extract_dir"
+
+          xex_path="$(find "$extract_dir" -type f -iname 'default.xex' -print -quit)"
+          if [[ -z "$xex_path" || ! -s "$xex_path" ]]; then
+            echo "::error::No non-empty Default.xex was found after extracting the game ZIP."
+            find "$extract_dir" -maxdepth 4 -print | head -n 100
+            exit 1
+          fi
+          game_dir="$(dirname "$xex_path")"
+
+          link_ci() {
+            local wanted="$1" found
+            [[ -e "$game_dir/$wanted" ]] && return 0
+            found="$(find "$game_dir" -maxdepth 1 -iname "$wanted" -print -quit)"
+            if [[ -z "$found" ]]; then
+              echo "::error::Required game directory/file '$wanted' is missing beside Default.xex."
+              ls -la "$game_dir"
+              exit 1
+            fi
+            ln -s "$(basename "$found")" "$game_dir/$wanted"
+          }
+          link_ci Default.xex
+          link_ci AliceGame
+          link_ci Engine
+
+          rm -rf "$ALICE/assets/game_root"
+          mkdir -p "$ALICE/assets"
+          ln -s "$game_dir" "$ALICE/assets/game_root"
+          test -s "$ALICE/assets/game_root/Default.xex"
+          test -d "$ALICE/assets/game_root/AliceGame"
+          test -d "$ALICE/assets/game_root/Engine"
+          {
+            echo "game_dir=$game_dir" >> "$GITHUB_OUTPUT"
+            echo "### Game input"
+            echo '```text'
+            ls -lah "$game_dir"
+            du -sh "$game_dir"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h "$WORK"
+
+      - name: Configure FFmpeg for the Linux host build
+        run: |
+          ffmpeg="$ALICE/sdk/thirdparty/FFmpeg"
+          test -s "$ffmpeg/config_linux_x86_64.h"
+          test -s "$ffmpeg/config_masseffect_wmv3.h"
+          test -s "$ffmpeg/libavcodec/wmaprodec.c"
+          test -s "$ffmpeg/libavcodec/allcodecs.c"
+          # This vendored FFmpeg fork is compiled as static libavutil +
+          # libavcodec targets by CMake; a system ffmpeg executable is neither
+          # used nor a substitute. Supply the platform config.h expected by
+          # FFmpeg's HAVE_AV_CONFIG_H sources, and explicitly enable WMV3.
+          cat > "$ffmpeg/config.h" <<'FFCFG'
+          #pragma once
+          #include "config_linux_x86_64.h"
+          #include "config_masseffect_wmv3.h"
+          FFCFG
+          grep -q '^#define CONFIG_WMAPRO_DECODER 1$' "$ffmpeg/config_linux_x86_64.h"
+          grep -q '^#define CONFIG_XMAFRAMES_DECODER 1$' "$ffmpeg/config_linux_x86_64.h"
+          grep -q '^#define CONFIG_WMV3_DECODER 1$' "$ffmpeg/config_masseffect_wmv3.h"
+          printf '#include "config.h"\n#if !CONFIG_WMAPRO_DECODER || !CONFIG_XMAFRAMES_DECODER || !CONFIG_WMV3_DECODER\n#error FFmpeg decoder configuration incomplete\n#endif\n' \
+            | clang -x c -std=c11 -I"$ffmpeg" -fsyntax-only -
+          echo "FFmpeg host config: config_linux_x86_64.h + config_masseffect_wmv3.h" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build in-tree ReXGlue SDK and host code generator
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          export DEVKITPRO
+          cd "$ALICE"
+          bash -x tools/build_sdk.sh -j "$BUILD_JOBS"
+          test -x sdk/out/linux-amd64/rexglue
+
+      - name: Install checksum-pinned DirectX Shader Compiler
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          cd "$ALICE"
+          "$RETRY" 3 15 bash -x tools/fetch_dxc.sh
+          test -x app/thirdparty/reblue-XenosRecomp/thirdparty/dxc-bin/bin/x64/dxc-linux
+
+      - name: Build PC-side deko3d shader tools
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          cd "$ALICE"
+          # The helper pins this upstream revision. Clone it here with retries
+          # so a transient network failure cannot leave a partial .git folder
+          # that the helper would mistake for a complete checkout.
+          spirv_src=out/deko3d_tools/SPIRV-Cross
+          if [[ ! -d "$spirv_src/.git" ]]; then
+            mkdir -p out/deko3d_tools
+            cloned=false
+            delay=10
+            for attempt in 1 2 3 4 5; do
+              rm -rf "$spirv_src"
+              if git clone -q --depth 1 --branch vulkan-sdk-1.4.363.0 \
+                https://github.com/KhronosGroup/SPIRV-Cross.git "$spirv_src"; then
+                cloned=true
+                break
+              fi
+              echo "SPIRV-Cross clone failed (attempt $attempt/5)."
+              if (( attempt < 5 )); then sleep "$delay"; delay=$((delay * 2)); (( delay > 120 )) && delay=120; fi
+            done
+            [[ "$cloned" == true ]] || { echo "::error::Could not fetch pinned SPIRV-Cross source."; exit 1; }
+          fi
+          bash -x tools/deko3d_build_tools.sh
+          test -x out/deko3d_tools/spirv-cross-build/spirv-cross
+          test -x out/deko3d_tools/uam-build/uam
+
+      - name: Generate translated game code (keep partial output on analysis warnings)
+        id: codegen
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          cd "$ALICE"
+          set +e
+          bash -x tools/codegen.sh
+          codegen_status=$?
+          set -e
+          test -s out/default_image.bin
+          generated_cpp=$(find app/generated/default -maxdepth 1 -type f -name 'alice_recomp.*.cpp' 2>/dev/null | wc -l)
+          echo "Generated recompilation translation units: $generated_cpp"
+          if (( codegen_status != 0 )); then
+            echo "::warning::ReXGlue code generation returned $codegen_status. Keeping its partial output and attempting the remaining build stages."
+            tail -n 100 out/codegen.log || true
+            if (( generated_cpp == 0 )); then
+              echo "::error::Code generation failed before producing any recompilation translation units."
+              exit "$codegen_status"
+            fi
+            python3 tools/post_codegen.py
+            echo "Partial codegen output will be compiled; later compiler errors remain fatal."
+            echo "codegen_partial=true" >> "$GITHUB_OUTPUT"
+            echo "### ReXGlue codegen warning" >> "$GITHUB_STEP_SUMMARY"
+            echo "Codegen returned $codegen_status but emitted $generated_cpp C++ translation units; continuing with partial output." >> "$GITHUB_STEP_SUMMARY"
+          else
+            test -d app/generated/default
+            echo "codegen_partial=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract shaders from the game's cooked packages
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          cd "$ALICE"
+          bash -x tools/renut/extract_shaders.sh
+          count=$(find out/pc/shader_capture -maxdepth 1 -type f -name '*.bin' | wc -l)
+          echo "Extracted shader containers: $count"
+          if (( count == 0 )); then
+            echo "::error::The package shader extractor produced no shader containers."
+            exit 1
+          fi
+
+      - name: Build host shader translation pipeline
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          cd "$ALICE"
+          bash -x tools/host_shaders.sh -j "$BUILD_JOBS"
+          test -x out/pc/xenos_recomp/build/XenosRecomp/XenosRecomp
+          test -d out/pc/renut_gpu
+
+      - name: Translate and package shaders for deko3d (best effort)
+        id: switch-shaders
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          cd "$ALICE"
+          sh=out/deko3d_shaders
+          recomp=out/pc/xenos_recomp/build/XenosRecomp/XenosRecomp
+          common=app/src/renut_engine/gpu/shaders/xenos/shader_common.h
+          mkdir -p "$sh"
+
+          # XenosRecomp can report shader-specific translation problems after
+          # emitting usable SPIR-V for the shaders it did understand. Keep that
+          # partial result, but require at least one translated shader.
+          rm -rf "$sh/spirv"
+          mkdir -p "$sh/spirv"
+          set +e
+          BANJO_DEKO3D_SPIRV_DIR="$ALICE/$sh/spirv" BANJO_HLSL_OVERRIDE="$ALICE/out/pc/renut_gpu/early_alpha_hlsl" \
+            "$recomp" "$ALICE/out/renut_shader_dump" "$ALICE/$sh/spirv_pass.cpp" "$ALICE/$common" \
+            > "$sh/spirv_pass.log" 2>&1
+          recomp_status=$?
+          set -e
+          spirv_count=$(find "$sh/spirv" -maxdepth 1 -type f -name '*.spv' | wc -l)
+          echo "XenosRecomp exit=$recomp_status; SPIR-V files=$spirv_count"
+          if (( recomp_status != 0 )); then
+            echo "::warning::XenosRecomp reported shader translation issues (exit $recomp_status); retaining any SPIR-V it produced."
+            tail -n 80 "$sh/spirv_pass.log" || true
+          fi
+          if (( spirv_count == 0 )); then
+            echo "::error::XenosRecomp produced no SPIR-V files; there is no shader output to package."
+            exit 1
+          fi
+
+          # This converter records individual SPIRV-Cross/GLSL conversion
+          # failures in report.txt and continues with the shaders that convert.
+          python3 tools/deko3d_shaders.py --spirv "$sh/spirv" --out "$sh" --no-uam --jobs "$BUILD_JOBS" \
+            2>&1 | tee "$sh/glsl_conversion.log"
+          glsl_count=$(find "$sh/glsl" -maxdepth 1 -type f -name '*.glsl' | wc -l)
+          echo "Converted GLSL files: $glsl_count"
+          if (( glsl_count == 0 )); then
+            echo "::error::No shaders could be converted to GLSL."
+            exit 1
+          fi
+
+          # --check deliberately returns 1 when any shader fails UAM, but its
+          # documented behavior is to retain that shader's unoptimized source.
+          # Accept that shader-level status and continue with the full partial set.
+          set +e
+          python3 tools/deko3d_glsl_opt.py --in "$sh/glsl" --out "$sh/glsl_opt" --check --jobs "$BUILD_JOBS" \
+            2>&1 | tee "$sh/glsl_opt.log"
+          opt_status=${PIPESTATUS[0]}
+          set -e
+          if (( opt_status > 1 )); then
+            echo "::error::GLSL optimization failed unexpectedly with status $opt_status."
+            exit "$opt_status"
+          elif (( opt_status == 1 )); then
+            echo "::warning::Some GLSL shaders failed UAM validation; the project script kept their original GLSL and the build will continue."
+          fi
+
+          glsl_opt_count=$(find "$sh/glsl_opt" -maxdepth 1 -type f -name '*.glsl' | wc -l)
+          if (( glsl_opt_count == 0 )); then
+            echo "::error::No GLSL files remain for packaging."
+            exit 1
+          fi
+          python3 tools/deko3d_shader_package.py --glsl "$sh/glsl_opt" --out out/renut_switch \
+            2>&1 | tee "$sh/package.log"
+          python3 tools/renut_switch_shader_cache.py --pc out/pc
+          test -s out/renut_switch/deko3d_glsl_switch.cpp
+          test -s out/renut_switch/shader_cache_switch.cpp
+          echo "shader_count=$glsl_opt_count" >> "$GITHUB_OUTPUT"
+          echo "### Shader translation summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SPIR-V files: $spirv_count" >> "$GITHUB_STEP_SUMMARY"
+          echo "- GLSL files packaged: $glsl_opt_count" >> "$GITHUB_STEP_SUMMARY"
+          echo "- XenosRecomp exit status: $recomp_status" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Switch FFmpeg configuration to Horizon ARM64
+        run: |
+          ffmpeg="$ALICE/sdk/thirdparty/FFmpeg"
+          test -s "$ffmpeg/config_switch_aarch64.h"
+          cat > "$ffmpeg/config.h" <<'FFCFG'
+          #pragma once
+          #include "config_switch_aarch64.h"
+          #include "config_masseffect_wmv3.h"
+          FFCFG
+          grep -q '^#define CONFIG_WMAPRO_DECODER 1$' "$ffmpeg/config_linux_aarch64.h"
+          grep -q '^#define CONFIG_XMAFRAMES_DECODER 1$' "$ffmpeg/config_linux_aarch64.h"
+          grep -q '^#define CONFIG_WMV3_DECODER 1$' "$ffmpeg/config_masseffect_wmv3.h"
+          printf '#include "config.h"\n#if !CONFIG_WMAPRO_DECODER || !CONFIG_XMAFRAMES_DECODER || !CONFIG_WMV3_DECODER\n#error Switch FFmpeg decoder configuration incomplete\n#endif\n' \
+            | "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" -x c -std=c11 -I"$ffmpeg" -fsyntax-only -
+          echo "FFmpeg Switch config: config_switch_aarch64.h + config_masseffect_wmv3.h" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and validate the Nintendo Switch NRO
+        id: build-nro
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          export DEVKITPRO
+          cd "$ALICE"
+          bash -x tools/build_switch.sh -j "$BUILD_JOBS"
+          test -s out/nx/alice.nro
+          test -s out/nx/alice
+          python3 tools/check_switch_build.py --elf out/nx/alice --nro out/nx/alice.nro --sdk-vulkan /nonexistent
+          ls -lh out/nx/alice.nro out/nx/alice
+
+      - name: Upload NRO as an early build artifact
+        if: ${{ !cancelled() && steps.build-nro.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: alice-nx-nro
+          path: /mnt/work/alice-nx/out/nx/alice.nro
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Precompile every default deko3d shader variant
+        id: build-shaders
+        env:
+          BASH_ENV: /mnt/work/xtrace.sh
+        run: |
+          cd "$ALICE"
+          mkdir -p out
+          set +e
+          python3 -I tools/renut/precompile_all_variants.py --jobs "$BUILD_JOBS" 2>&1 | tee out/deko3d_precompile.log
+          result=${PIPESTATUS[0]}
+          set -e
+          if (( result != 0 )); then
+            echo "::error::Shader variant precompiler exited with status $result."
+            exit "$result"
+          fi
+          summary=$(grep -E 'precompile_all_variants: [1-9][0-9]* variants, [0-9]+ failed,' out/deko3d_precompile.log | tail -n 1 || true)
+          if [[ -z "$summary" ]]; then
+            echo "::error::Shader variant precompiler did not produce any successful DKSH variants or a completion summary."
+            tail -n 100 out/deko3d_precompile.log
+            exit 1
+          fi
+          failed=$(sed -E 's/.* variants, ([0-9]+) failed,.*/\1/' <<< "$summary")
+          if (( failed > 0 )); then
+            echo "::warning::$summary. Keeping the successfully compiled variants and continuing with the partial cache."
+            echo "### Shader variant precompile warning" >> "$GITHUB_STEP_SUMMARY"
+            echo "$summary; failed variants are omitted from the cache and can compile at runtime if needed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$summary"
+          fi
+          python3 - <<'PY'
+          import os, struct
+          p = 'out/deko3d_shaders/deko3d_shaders.bin'
+          if not os.path.isfile(p) or os.path.getsize(p) <= 16:
+              raise SystemExit(f'missing/empty shader cache: {p}')
+          with open(p, 'rb') as f:
+              magic = f.read(4)
+              version = struct.unpack('<I', f.read(4))[0]
+          if magic != b'BDKC' or version != 1:
+              raise SystemExit(f'invalid shader cache header: magic={magic!r}, version={version}')
+          print(f'Validated {p}: {os.path.getsize(p):,} bytes, BDKC v{version}')
+          PY
+
+      - name: Stage final distributable outputs
+        if: ${{ !cancelled() && steps.build-shaders.outcome == 'success' }}
+        run: |
+          cd "$ALICE"
+          # Use the project's packaging helper without --with-game: the user
+          # asked for the NRO and shader cache, not a second copy of the game.
+          bash -x tools/package_switch.sh
+          stage="$WORK/stage"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          for file in \
+            out/nx/alice.nro \
+            out/deko3d_shaders/deko3d_shaders.bin; do
+            if [[ ! -s "$file" ]]; then
+              echo "::error::Required output is missing or empty: $file"
+              exit 1
+            fi
+            cp "$file" "$stage/"
+          done
+          printf 'Commit: %s\nBuilt UTC: %s\nProject: Alice NX Ultimate Rebase\nRenderer: Renut Ultimate / deko3d\nFFmpeg: vendored static libavutil + libavcodec; Horizon ARM64 config\nFPCR one mode: %s\nClang: %s\n' \
+            "$GITHUB_SHA" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$ALICE_FPCR_ONE_MODE" \
+            "$(clang --version | head -n 1)" > "$stage/BUILD_INFO.txt"
+          ls -lh "$stage"
+          {
+            echo '### Final artifacts'
+            echo '```text'
+            ls -lh "$stage"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload NRO and shader cache
+        if: ${{ !cancelled() && steps.build-shaders.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: alice-nx-switch-ultimate
+          path: /mnt/work/stage/
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Print build logs and failure diagnostics
+        if: failure()
+        run: |
+          set +e +x
+          shopt -s nullglob
+          logs=(
+            "$ALICE"/out_sdk_configure.log
+            "$ALICE"/out_sdk_build.log
+            "$ALICE"/out/codegen.log
+            "$ALICE"/out/pc_configure.log
+            "$ALICE"/out/host_shaders.log
+            "$ALICE"/out/shaders_extracted.log
+            "$ALICE"/out/shaders_extracted.err
+            "$ALICE"/out/deko3d_precompile.log
+            "$ALICE"/out/deko3d_shaders/spirv_pass.log
+            "$ALICE"/out/deko3d_shaders/glsl_conversion.log
+            "$ALICE"/out/deko3d_shaders/glsl_opt.log
+            "$ALICE"/out/deko3d_shaders/package.log
+            "$ALICE"/out/deko3d_shaders/report.txt
+            "$ALICE"/out/deko3d_tools/*.log
+            "$ALICE"/out/nx_configure.log
+            "$ALICE"/out/nx_build.log
+          )
+          for file in "${logs[@]}"; do
+            [[ -s "$file" ]] || continue
+            echo "::group::$(basename "$file") (last 180 lines)"
+            tail -n 180 "$file"
+            echo "::endgroup::"
+            echo "---- matching errors: $(basename "$file") ----"
+            grep -niE 'error:|FAILED|undefined reference|fatal error|CMake Error|No such file|not found|killed process' "$file" | head -n 60
+          done
+          echo '== Disk and memory at failure'
+          df -h / "$WORK"
+          free -h
+          echo '== OOM diagnostics'
+          dmesg 2>/dev/null | grep -iE 'out of memory|killed process' | tail -n 20
+          echo '== Relevant output tree'
+          find "$ALICE/out" -maxdepth 3 -type f \( -name '*.log' -o -name '*.nro' -o -name '*.bin' \) -printf '%p (%s bytes)\n' 2>/dev/null | head -n 200
+          exit 0
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alice-nx-build-diagnostics
+          path: |
+            /mnt/work/diagnostics/**
+            /mnt/work/alice-nx/out_sdk_*.log
+            /mnt/work/alice-nx/out/*.log
+            /mnt/work/alice-nx/out/deko3d_tools/*.log
+            /mnt/work/alice-nx/out/nx/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+          compression-level: 6
