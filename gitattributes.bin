@@ -1,0 +1,4 @@
+# Force LF line endings for files that the Linux build checks or executes.
+# CRLF in these breaks exact-match greps and shell scripts on the runner.
+*.h  text eol=lf
+*.sh text eol=lf
